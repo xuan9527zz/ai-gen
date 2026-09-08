@@ -1,0 +1,47 @@
+{
+  "workflow_path": "workflows/anime.json",
+  "database_path": "data/illustrious.sqlite3",
+  "output_root": "data/generated",
+  "comfy_url": "http://127.0.0.1:8188",
+  "images_per_run": 5,
+  "seed_mode": "random",
+  "negative_prompt": "worst quality, low quality, lowres, blurry, jpeg artifacts, text, watermark, signature, logo, bad anatomy, bad hands, extra fingers, missing fingers, fused fingers, extra limbs, malformed limbs, deformed, poorly drawn face, bad eyes, duplicate, cropped, out of frame, censored, mosaic censoring, bar censor",
+  "resolution": {
+    "mode": "workflow"
+  },
+  "apply_lora_to_refiner": true,
+  "use_lora_clip_for_negative": true,
+  "lora_slots": [
+    {
+      "enabled": false,
+      "name": "",
+      "strength_model": 0.7,
+      "strength_clip": 0.7
+    },
+    {
+      "enabled": false,
+      "name": "",
+      "strength_model": 0.7,
+      "strength_clip": 0.7
+    },
+    {
+      "enabled": false,
+      "name": "",
+      "strength_model": 0.7,
+      "strength_clip": 0.7
+    }
+  ],
+  "workflow_nodes": {
+    "base_checkpoint": "4",
+    "latent": "5",
+    "base_positive": "6",
+    "base_negative": "7",
+    "base_sampler": "10",
+    "refiner_sampler": "11",
+    "refiner_checkpoint": "12",
+    "refiner_positive": "15",
+    "refiner_negative": "16",
+    "vae_decode": "17",
+    "save_image": "19"
+  }
+}

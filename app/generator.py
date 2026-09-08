@@ -1,0 +1,1865 @@
+# -*- coding: utf-8 -*-
+r"""
+Illustrious ComfyUI Generator v1.1
+
+Purpose
+-------
+Generate reconstruction candidates from one Analyzer run_id.
+
+Current behavior:
+- Reads final_prompt from SQLite analysis_runs.
+- Loads the user's ComfyUI API workflow template.
+- Replaces positive prompt in BOTH base/refiner text nodes.
+- Replaces negative prompt in BOTH base/refiner text nodes.
+- Supports 3 logical LoRA slots.
+- Applies the same enabled LoRA stack to BOTH base and refiner stages.
+- Generates 5 images by default, each with a different random seed.
+- Downloads generated images into:
+      F:\OpenWebUI\generated\run_<RUN_ID>\
+- Stores each generation recipe/result in SQLite generation_runs.
+- Creates generation_ratings table now for the later comparison UI.
+
+Designed for the uploaded workflow structure:
+    base checkpoint     node 4
+    latent              node 5
+    base positive       node 6
+    base negative       node 7
+    base sampler        node 10
+    refiner sampler     node 11
+    refiner checkpoint  node 12
+    refiner positive    node 15
+    refiner negative    node 16
+    VAE decode          node 17
+    SaveImage           node 19
+
+The script dynamically removes template LoraLoader nodes and rebuilds
+the active LoRA stack from config, so stale disabled LoRA nodes cannot
+accidentally affect generation.
+
+Run:
+    py F:\OpenWebUI\illustrious_generate.py
+
+Or:
+    py F:\OpenWebUI\illustrious_generate.py --run-id 30
+
+Optional:
+    py F:\OpenWebUI\illustrious_generate.py --run-id 30 --count 5
+
+Config:
+    F:\OpenWebUI\illustrious_generation_config.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import json
+import mimetypes
+import secrets
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlencode
+
+import requests
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "generation.json"
+
+GENERATOR_VERSION = "1.1"
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+
+    with path.open("rb") as f:
+        for chunk in iter(
+            lambda: f.read(
+                1024 * 1024
+            ),
+            b"",
+        ):
+            h.update(
+                chunk
+            )
+
+    return h.hexdigest()
+
+
+def load_json(path: Path) -> Dict[str, Any]:
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+    ) as f:
+        data = json.load(
+            f
+        )
+
+    if not isinstance(
+        data,
+        dict,
+    ):
+        raise ValueError(
+            f"JSON top level must be object: {path}"
+        )
+
+    return data
+
+
+def save_json(
+    path: Path,
+    data: Dict[str, Any],
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    path.write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+def load_config(
+    path: Path,
+) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Config not found: {path}"
+        )
+
+    cfg = load_json(
+        path
+    )
+
+    # Project package: relative paths in config are resolved against repo root.
+    for key in (
+        "workflow_path",
+        "database_path",
+        "output_root",
+    ):
+        raw = cfg.get(key)
+        if raw:
+            candidate = Path(str(raw))
+            if not candidate.is_absolute():
+                cfg[key] = str(
+                    (PROJECT_ROOT / candidate).resolve()
+                )
+
+    required = (
+        "workflow_path",
+        "database_path",
+        "output_root",
+        "comfy_url",
+        "negative_prompt",
+        "lora_slots",
+        "workflow_nodes",
+    )
+
+    for key in required:
+        if key not in cfg:
+            raise KeyError(
+                f"Config missing key: {key}"
+            )
+
+    slots = cfg.get(
+        "lora_slots"
+    )
+
+    if not isinstance(
+        slots,
+        list,
+    ) or len(
+        slots
+    ) != 3:
+        raise ValueError(
+            "lora_slots must contain exactly 3 slots."
+        )
+
+    return cfg
+
+
+def enabled_loras(
+    cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    out = []
+
+    for index, raw in enumerate(
+        cfg.get(
+            "lora_slots",
+            [],
+        ),
+        start=1,
+    ):
+        if not isinstance(
+            raw,
+            dict,
+        ):
+            continue
+
+        enabled = bool(
+            raw.get(
+                "enabled",
+                False,
+            )
+        )
+
+        name = str(
+            raw.get(
+                "name",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not enabled:
+            continue
+
+        if not name:
+            raise ValueError(
+                f"LoRA slot {index} is enabled but name is empty."
+            )
+
+        out.append({
+            "slot": index,
+            "name": name,
+            "strength_model": float(
+                raw.get(
+                    "strength_model",
+                    1.0,
+                )
+            ),
+            "strength_clip": float(
+                raw.get(
+                    "strength_clip",
+                    1.0,
+                )
+            ),
+        })
+
+    return out
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+GENERATION_SCHEMA = r"""
+CREATE TABLE IF NOT EXISTS generation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    analysis_run_id INTEGER NOT NULL,
+
+    generator_version TEXT NOT NULL,
+
+    status TEXT NOT NULL,
+
+    prompt TEXT NOT NULL,
+    negative_prompt TEXT NOT NULL,
+
+    seed INTEGER NOT NULL,
+
+    width INTEGER,
+    height INTEGER,
+
+    base_checkpoint TEXT,
+    refiner_checkpoint TEXT,
+
+    loras_json TEXT NOT NULL DEFAULT '[]',
+    sampling_json TEXT NOT NULL DEFAULT '{}',
+
+    workflow_path TEXT,
+    workflow_sha256 TEXT,
+    workflow_snapshot_json TEXT NOT NULL,
+
+    comfy_prompt_id TEXT,
+    comfy_output_json TEXT NOT NULL DEFAULT '{}',
+
+    generated_image_path TEXT,
+    generated_image_sha256 TEXT,
+
+    elapsed_seconds REAL,
+
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+
+    FOREIGN KEY(analysis_run_id)
+        REFERENCES analysis_runs(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_runs_analysis
+ON generation_runs(analysis_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_generation_runs_status
+ON generation_runs(status);
+
+CREATE INDEX IF NOT EXISTS idx_generation_runs_seed
+ON generation_runs(seed);
+
+CREATE TABLE IF NOT EXISTS generation_ratings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    generation_run_id INTEGER NOT NULL UNIQUE,
+
+    overall_score INTEGER,
+    comment TEXT,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY(generation_run_id)
+        REFERENCES generation_runs(id)
+        ON DELETE CASCADE,
+
+    CHECK(
+        overall_score IS NULL
+        OR overall_score BETWEEN 1 AND 5
+    )
+);
+"""
+
+
+def connect_db(
+    db_path: Path,
+) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"Database not found: {db_path}"
+        )
+
+    conn = sqlite3.connect(
+        str(
+            db_path
+        ),
+        timeout=60,
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute(
+        "PRAGMA foreign_keys=ON"
+    )
+
+    conn.executescript(
+        GENERATION_SCHEMA
+    )
+
+    conn.commit()
+
+    return conn
+
+
+def get_analysis_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT
+            r.*,
+            i.filename,
+            i.first_seen_path
+        FROM analysis_runs r
+        JOIN images i
+          ON i.id=r.image_id
+        WHERE r.id=?
+        """,
+        (
+            run_id,
+        ),
+    ).fetchone()
+
+    if not row:
+        raise ValueError(
+            f"Analysis run not found: {run_id}"
+        )
+
+    return row
+
+
+def create_generation_row(
+    conn: sqlite3.Connection,
+    *,
+    analysis_run_id: int,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    width: Optional[int],
+    height: Optional[int],
+    base_checkpoint: Optional[str],
+    refiner_checkpoint: Optional[str],
+    loras: List[Dict[str, Any]],
+    sampling: Dict[str, Any],
+    workflow_path: Path,
+    workflow_sha256: str,
+    workflow_snapshot: Dict[str, Any],
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO generation_runs(
+            analysis_run_id,
+            generator_version,
+            status,
+            prompt,
+            negative_prompt,
+            seed,
+            width,
+            height,
+            base_checkpoint,
+            refiner_checkpoint,
+            loras_json,
+            sampling_json,
+            workflow_path,
+            workflow_sha256,
+            workflow_snapshot_json,
+            created_at
+        )
+        VALUES(
+            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        )
+        """,
+        (
+            analysis_run_id,
+            GENERATOR_VERSION,
+            "queued",
+            prompt,
+            negative_prompt,
+            seed,
+            width,
+            height,
+            base_checkpoint,
+            refiner_checkpoint,
+            json_dumps(
+                loras
+            ),
+            json_dumps(
+                sampling
+            ),
+            str(
+                workflow_path
+            ),
+            workflow_sha256,
+            json_dumps(
+                workflow_snapshot
+            ),
+            now_iso(),
+        ),
+    )
+
+    conn.commit()
+
+    return int(
+        cur.lastrowid
+    )
+
+
+def finish_generation_row(
+    conn: sqlite3.Connection,
+    generation_id: int,
+    *,
+    status: str,
+    prompt_id: Optional[str] = None,
+    comfy_output: Optional[Dict[str, Any]] = None,
+    generated_path: Optional[Path] = None,
+    generated_sha256: Optional[str] = None,
+    elapsed_seconds: Optional[float] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE generation_runs
+        SET
+            status=?,
+            comfy_prompt_id=?,
+            comfy_output_json=?,
+            generated_image_path=?,
+            generated_image_sha256=?,
+            elapsed_seconds=?,
+            finished_at=?
+        WHERE id=?
+        """,
+        (
+            status,
+            prompt_id,
+            json_dumps(
+                comfy_output
+                or {}
+            ),
+            (
+                str(
+                    generated_path
+                )
+                if generated_path
+                else None
+            ),
+            generated_sha256,
+            elapsed_seconds,
+            now_iso(),
+            generation_id,
+        ),
+    )
+
+    conn.commit()
+
+
+# ============================================================
+# COMFY WORKFLOW
+# ============================================================
+
+def validate_node(
+    workflow: Dict[str, Any],
+    node_id: str,
+    expected_class: Optional[str] = None,
+) -> Dict[str, Any]:
+    if node_id not in workflow:
+        raise KeyError(
+            f"Workflow missing node {node_id}"
+        )
+
+    node = workflow[
+        node_id
+    ]
+
+    if not isinstance(
+        node,
+        dict,
+    ):
+        raise ValueError(
+            f"Workflow node {node_id} is invalid."
+        )
+
+    if expected_class:
+        actual = node.get(
+            "class_type"
+        )
+
+        if actual != expected_class:
+            raise ValueError(
+                f"Node {node_id}: expected {expected_class}, got {actual}"
+            )
+
+    if "inputs" not in node:
+        node[
+            "inputs"
+        ] = {}
+
+    return node
+
+
+def validate_workflow(
+    workflow: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> Dict[str, str]:
+    ids = {
+        key: str(
+            value
+        )
+        for key, value
+        in cfg[
+            "workflow_nodes"
+        ].items()
+    }
+
+    expected = {
+        "base_checkpoint": (
+            "CheckpointLoaderSimple"
+        ),
+        "latent": (
+            "EmptyLatentImage"
+        ),
+        "base_positive": (
+            "CLIPTextEncode"
+        ),
+        "base_negative": (
+            "CLIPTextEncode"
+        ),
+        "base_sampler": (
+            "KSamplerAdvanced"
+        ),
+        "refiner_sampler": (
+            "KSamplerAdvanced"
+        ),
+        "refiner_checkpoint": (
+            "CheckpointLoaderSimple"
+        ),
+        "refiner_positive": (
+            "CLIPTextEncode"
+        ),
+        "refiner_negative": (
+            "CLIPTextEncode"
+        ),
+        "vae_decode": (
+            "VAEDecode"
+        ),
+        "save_image": (
+            "SaveImage"
+        ),
+    }
+
+    for key, class_type in expected.items():
+        if key not in ids:
+            raise KeyError(
+                f"workflow_nodes missing: {key}"
+            )
+
+        validate_node(
+            workflow,
+            ids[key],
+            class_type,
+        )
+
+    return ids
+
+
+def remove_existing_lora_nodes(
+    workflow: Dict[str, Any],
+) -> List[str]:
+    removed = []
+
+    for node_id in list(
+        workflow.keys()
+    ):
+        node = workflow[
+            node_id
+        ]
+
+        if (
+            isinstance(
+                node,
+                dict,
+            )
+            and node.get(
+                "class_type"
+            )
+            == "LoraLoader"
+        ):
+            removed.append(
+                node_id
+            )
+
+            del workflow[
+                node_id
+            ]
+
+    return removed
+
+
+def add_lora_chain(
+    workflow: Dict[str, Any],
+    *,
+    start_model: List[Any],
+    start_clip: List[Any],
+    loras: List[Dict[str, Any]],
+    node_id_start: int,
+    title_prefix: str,
+) -> Tuple[List[Any], List[Any], List[str]]:
+    model_ref = copy.deepcopy(
+        start_model
+    )
+
+    clip_ref = copy.deepcopy(
+        start_clip
+    )
+
+    added_ids: List[str] = []
+
+    for offset, lora in enumerate(
+        loras
+    ):
+        node_id = str(
+            node_id_start
+            + offset
+        )
+
+        workflow[
+            node_id
+        ] = {
+            "inputs": {
+                "lora_name": lora[
+                    "name"
+                ],
+                "strength_model": lora[
+                    "strength_model"
+                ],
+                "strength_clip": lora[
+                    "strength_clip"
+                ],
+                "model": model_ref,
+                "clip": clip_ref,
+            },
+            "class_type": (
+                "LoraLoader"
+            ),
+            "_meta": {
+                "title": (
+                    f"{title_prefix} "
+                    f"LoRA Slot "
+                    f"{lora['slot']}"
+                )
+            },
+        }
+
+        model_ref = [
+            node_id,
+            0,
+        ]
+
+        clip_ref = [
+            node_id,
+            1,
+        ]
+
+        added_ids.append(
+            node_id
+        )
+
+    return (
+        model_ref,
+        clip_ref,
+        added_ids,
+    )
+
+
+def build_workflow_for_generation(
+    template: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    prompt: str,
+    seed: int,
+    filename_prefix: str,
+) -> Tuple[
+    Dict[str, Any],
+    Dict[str, Any],
+]:
+    workflow = copy.deepcopy(
+        template
+    )
+
+    ids = validate_workflow(
+        workflow,
+        cfg,
+    )
+
+    loras = enabled_loras(
+        cfg
+    )
+
+    remove_existing_lora_nodes(
+        workflow
+    )
+
+    base_ckpt = validate_node(
+        workflow,
+        ids[
+            "base_checkpoint"
+        ],
+    )
+
+    ref_ckpt = validate_node(
+        workflow,
+        ids[
+            "refiner_checkpoint"
+        ],
+    )
+
+    base_start_model = [
+        ids[
+            "base_checkpoint"
+        ],
+        0,
+    ]
+
+    base_start_clip = [
+        ids[
+            "base_checkpoint"
+        ],
+        1,
+    ]
+
+    (
+        base_model_ref,
+        base_clip_ref,
+        base_lora_nodes,
+    ) = add_lora_chain(
+        workflow,
+        start_model=(
+            base_start_model
+        ),
+        start_clip=(
+            base_start_clip
+        ),
+        loras=loras,
+        node_id_start=9001,
+        title_prefix="BASE",
+    )
+
+    if bool(
+        cfg.get(
+            "apply_lora_to_refiner",
+            True,
+        )
+    ):
+        (
+            refiner_model_ref,
+            refiner_clip_ref,
+            refiner_lora_nodes,
+        ) = add_lora_chain(
+            workflow,
+            start_model=[
+                ids[
+                    "refiner_checkpoint"
+                ],
+                0,
+            ],
+            start_clip=[
+                ids[
+                    "refiner_checkpoint"
+                ],
+                1,
+            ],
+            loras=loras,
+            node_id_start=9011,
+            title_prefix=(
+                "REFINER"
+            ),
+        )
+    else:
+        refiner_model_ref = [
+            ids[
+                "refiner_checkpoint"
+            ],
+            0,
+        ]
+
+        refiner_clip_ref = [
+            ids[
+                "refiner_checkpoint"
+            ],
+            1,
+        ]
+
+        refiner_lora_nodes = []
+
+    negative_prompt = str(
+        cfg[
+            "negative_prompt"
+        ]
+    ).strip()
+
+    base_positive = validate_node(
+        workflow,
+        ids[
+            "base_positive"
+        ],
+    )
+
+    base_negative = validate_node(
+        workflow,
+        ids[
+            "base_negative"
+        ],
+    )
+
+    refiner_positive = validate_node(
+        workflow,
+        ids[
+            "refiner_positive"
+        ],
+    )
+
+    refiner_negative = validate_node(
+        workflow,
+        ids[
+            "refiner_negative"
+        ],
+    )
+
+    base_positive[
+        "inputs"
+    ][
+        "text"
+    ] = prompt
+
+    refiner_positive[
+        "inputs"
+    ][
+        "text"
+    ] = prompt
+
+    base_negative[
+        "inputs"
+    ][
+        "text"
+    ] = negative_prompt
+
+    refiner_negative[
+        "inputs"
+    ][
+        "text"
+    ] = negative_prompt
+
+    base_positive[
+        "inputs"
+    ][
+        "clip"
+    ] = base_clip_ref
+
+    refiner_positive[
+        "inputs"
+    ][
+        "clip"
+    ] = refiner_clip_ref
+
+    use_lora_clip_for_negative = bool(
+        cfg.get(
+            "use_lora_clip_for_negative",
+            True,
+        )
+    )
+
+    if use_lora_clip_for_negative:
+        base_negative[
+            "inputs"
+        ][
+            "clip"
+        ] = base_clip_ref
+
+        refiner_negative[
+            "inputs"
+        ][
+            "clip"
+        ] = refiner_clip_ref
+    else:
+        base_negative[
+            "inputs"
+        ][
+            "clip"
+        ] = [
+            ids[
+                "base_checkpoint"
+            ],
+            1,
+        ]
+
+        refiner_negative[
+            "inputs"
+        ][
+            "clip"
+        ] = [
+            ids[
+                "refiner_checkpoint"
+            ],
+            1,
+        ]
+
+    base_sampler = validate_node(
+        workflow,
+        ids[
+            "base_sampler"
+        ],
+    )
+
+    refiner_sampler = validate_node(
+        workflow,
+        ids[
+            "refiner_sampler"
+        ],
+    )
+
+    base_sampler[
+        "inputs"
+    ][
+        "model"
+    ] = base_model_ref
+
+    base_sampler[
+        "inputs"
+    ][
+        "noise_seed"
+    ] = int(
+        seed
+    )
+
+    refiner_sampler[
+        "inputs"
+    ][
+        "model"
+    ] = refiner_model_ref
+
+    # This refiner has add_noise=disable in the template,
+    # so its seed is operationally irrelevant. Keep it explicit.
+    refiner_sampler[
+        "inputs"
+    ][
+        "noise_seed"
+    ] = int(
+        seed
+    )
+
+    save_node = validate_node(
+        workflow,
+        ids[
+            "save_image"
+        ],
+    )
+
+    save_node[
+        "inputs"
+    ][
+        "filename_prefix"
+    ] = filename_prefix
+
+    latent = validate_node(
+        workflow,
+        ids[
+            "latent"
+        ],
+    )
+
+    width = latent[
+        "inputs"
+    ].get(
+        "width"
+    )
+
+    height = latent[
+        "inputs"
+    ].get(
+        "height"
+    )
+
+    sampling = {
+        "base": {
+            key: base_sampler[
+                "inputs"
+            ].get(
+                key
+            )
+            for key in (
+                "steps",
+                "cfg",
+                "sampler_name",
+                "scheduler",
+                "start_at_step",
+                "end_at_step",
+                "add_noise",
+                "return_with_leftover_noise",
+            )
+        },
+        "refiner": {
+            key: refiner_sampler[
+                "inputs"
+            ].get(
+                key
+            )
+            for key in (
+                "steps",
+                "cfg",
+                "sampler_name",
+                "scheduler",
+                "start_at_step",
+                "end_at_step",
+                "add_noise",
+                "return_with_leftover_noise",
+            )
+        },
+    }
+
+    metadata = {
+        "width": (
+            int(
+                width
+            )
+            if width is not None
+            else None
+        ),
+        "height": (
+            int(
+                height
+            )
+            if height is not None
+            else None
+        ),
+        "base_checkpoint": (
+            base_ckpt[
+                "inputs"
+            ].get(
+                "ckpt_name"
+            )
+        ),
+        "refiner_checkpoint": (
+            ref_ckpt[
+                "inputs"
+            ].get(
+                "ckpt_name"
+            )
+        ),
+        "loras": loras,
+        "sampling": sampling,
+        "removed_template_loras": (
+            True
+        ),
+        "base_lora_nodes": (
+            base_lora_nodes
+        ),
+        "refiner_lora_nodes": (
+            refiner_lora_nodes
+        ),
+    }
+
+    return (
+        workflow,
+        metadata,
+    )
+
+
+# ============================================================
+# COMFYUI HTTP
+# ============================================================
+
+def check_comfy(
+    comfy_url: str,
+) -> None:
+    response = requests.get(
+        f"{comfy_url}/system_stats",
+        timeout=15,
+    )
+
+    response.raise_for_status()
+
+
+def submit_workflow(
+    comfy_url: str,
+    workflow: Dict[str, Any],
+) -> str:
+    payload = {
+        "prompt": workflow,
+        "client_id": str(
+            uuid.uuid4()
+        ),
+    }
+
+    response = requests.post(
+        f"{comfy_url}/prompt",
+        json=payload,
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    prompt_id = data.get(
+        "prompt_id"
+    )
+
+    if not prompt_id:
+        raise RuntimeError(
+            f"ComfyUI returned no prompt_id: {data}"
+        )
+
+    return str(
+        prompt_id
+    )
+
+
+def wait_for_history(
+    comfy_url: str,
+    prompt_id: str,
+    *,
+    timeout_seconds: int = 1800,
+) -> Dict[str, Any]:
+    start = time.time()
+
+    while (
+        time.time()
+        - start
+        < timeout_seconds
+    ):
+        response = requests.get(
+            f"{comfy_url}/history/{prompt_id}",
+            timeout=30,
+        )
+
+        response.raise_for_status()
+
+        history = response.json()
+
+        if prompt_id in history:
+            record = history[
+                prompt_id
+            ]
+
+            status = record.get(
+                "status",
+                {}
+            )
+
+            status_str = str(
+                status.get(
+                    "status_str",
+                    ""
+                )
+            ).lower()
+
+            completed = bool(
+                status.get(
+                    "completed",
+                    False,
+                )
+            )
+
+            if completed:
+                return record
+
+            if status_str in {
+                "error",
+                "failed",
+            }:
+                raise RuntimeError(
+                    f"ComfyUI generation failed: {record}"
+                )
+
+        time.sleep(
+            1
+        )
+
+    raise TimeoutError(
+        f"ComfyUI generation timed out: {prompt_id}"
+    )
+
+
+def extract_saved_images(
+    history_record: Dict[str, Any],
+    save_node_id: str,
+) -> List[Dict[str, Any]]:
+    outputs = history_record.get(
+        "outputs",
+        {}
+    )
+
+    if not isinstance(
+        outputs,
+        dict,
+    ):
+        return []
+
+    node = outputs.get(
+        save_node_id,
+        {}
+    )
+
+    if not isinstance(
+        node,
+        dict,
+    ):
+        return []
+
+    images = node.get(
+        "images",
+        []
+    )
+
+    if not isinstance(
+        images,
+        list,
+    ):
+        return []
+
+    return [
+        x
+        for x in images
+        if isinstance(
+            x,
+            dict,
+        )
+    ]
+
+
+def download_comfy_image(
+    comfy_url: str,
+    image_info: Dict[str, Any],
+    output_path: Path,
+) -> Path:
+    filename = str(
+        image_info.get(
+            "filename",
+            "",
+        )
+        or ""
+    )
+
+    if not filename:
+        raise ValueError(
+            "Comfy image info has no filename."
+        )
+
+    params = {
+        "filename": filename,
+        "subfolder": str(
+            image_info.get(
+                "subfolder",
+                "",
+            )
+            or ""
+        ),
+        "type": str(
+            image_info.get(
+                "type",
+                "output",
+            )
+            or "output"
+        ),
+    }
+
+    url = (
+        f"{comfy_url}/view?"
+        + urlencode(
+            params
+        )
+    )
+
+    response = requests.get(
+        url,
+        timeout=120,
+    )
+
+    response.raise_for_status()
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    output_path.write_bytes(
+        response.content
+    )
+
+    return output_path
+
+
+# ============================================================
+# SEEDS
+# ============================================================
+
+def make_seeds(
+    count: int,
+    mode: str = "random",
+) -> List[int]:
+    if count < 1:
+        raise ValueError(
+            "count must be >= 1"
+        )
+
+    if mode != "random":
+        raise ValueError(
+            "Only seed_mode=random is supported in v1.0."
+        )
+
+    seeds: List[int] = []
+    seen = set()
+
+    while len(
+        seeds
+    ) < count:
+        seed = secrets.randbelow(
+            2**63
+            - 1
+        )
+
+        if seed not in seen:
+            seen.add(
+                seed
+            )
+
+            seeds.append(
+                seed
+            )
+
+    return seeds
+
+
+# ============================================================
+# GENERATION
+# ============================================================
+
+def generate_candidates(
+    *,
+    run_id: int,
+    count: int,
+    cfg: Dict[str, Any],
+    prompt_override: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    db_path = Path(
+        cfg[
+            "database_path"
+        ]
+    )
+
+    workflow_path = Path(
+        cfg[
+            "workflow_path"
+        ]
+    )
+
+    output_root = Path(
+        cfg[
+            "output_root"
+        ]
+    )
+
+    comfy_url = str(
+        cfg[
+            "comfy_url"
+        ]
+    ).rstrip(
+        "/"
+    )
+
+    conn = connect_db(
+        db_path
+    )
+
+    try:
+        analysis = get_analysis_run(
+            conn,
+            run_id,
+        )
+
+        base_analysis_prompt = str(
+            analysis[
+                "final_prompt"
+            ]
+            or ""
+        ).strip()
+
+        if prompt_override is not None:
+            prompt = str(
+                prompt_override
+            ).strip()
+        else:
+            prompt = base_analysis_prompt
+
+        if not prompt:
+            raise ValueError(
+                f"Analysis run {run_id} has empty generation prompt."
+            )
+
+        template = load_json(
+            workflow_path
+        )
+
+        workflow_hash = sha256_file(
+            workflow_path
+        )
+
+        ids = validate_workflow(
+            template,
+            cfg,
+        )
+
+        check_comfy(
+            comfy_url
+        )
+
+        seeds = make_seeds(
+            count,
+            str(
+                cfg.get(
+                    "seed_mode",
+                    "random",
+                )
+            ),
+        )
+
+        loras = enabled_loras(
+            cfg
+        )
+
+        print()
+        print("=" * 70)
+        print("ILLUSTRIOUS COMFYUI GENERATOR")
+        print("=" * 70)
+        print(
+            f"Analysis run:  {run_id}"
+        )
+        print(
+            f"Image:         {analysis['filename']}"
+        )
+        print(
+            f"Workflow:      {workflow_path}"
+        )
+        print(
+            f"Candidates:    {count}"
+        )
+        print(
+            "Prompt source:  "
+            + (
+                "UI override"
+                if prompt_override is not None
+                else "Analyzer Final Prompt"
+            )
+        )
+        print(
+            f"LoRA slots on: {len(loras)} / 3"
+        )
+
+        for lora in loras:
+            print(
+                f"  Slot {lora['slot']}: "
+                f"{lora['name']} "
+                f"(model={lora['strength_model']}, "
+                f"clip={lora['strength_clip']})"
+            )
+
+        print()
+        print("Negative prompt:")
+        print(
+            cfg[
+                "negative_prompt"
+            ]
+        )
+        print()
+
+        results = []
+
+        run_dir = (
+            output_root
+            / f"run_{run_id}"
+        )
+
+        run_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        for index, seed in enumerate(
+            seeds,
+            start=1,
+        ):
+            print(
+                f"[{index}/{count}] seed={seed}"
+            )
+
+            stamp = dt.datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            prefix = (
+                f"recon_run{run_id}_"
+                f"{index:02d}_seed{seed}"
+            )
+
+            workflow, meta = (
+                build_workflow_for_generation(
+                    template,
+                    cfg,
+                    prompt=prompt,
+                    seed=seed,
+                    filename_prefix=(
+                        prefix
+                    ),
+                )
+            )
+
+            generation_id = (
+                create_generation_row(
+                    conn,
+                    analysis_run_id=run_id,
+                    prompt=prompt,
+                    negative_prompt=str(
+                        cfg[
+                            "negative_prompt"
+                        ]
+                    ),
+                    seed=seed,
+                    width=meta[
+                        "width"
+                    ],
+                    height=meta[
+                        "height"
+                    ],
+                    base_checkpoint=meta[
+                        "base_checkpoint"
+                    ],
+                    refiner_checkpoint=meta[
+                        "refiner_checkpoint"
+                    ],
+                    loras=meta[
+                        "loras"
+                    ],
+                    sampling=meta[
+                        "sampling"
+                    ],
+                    workflow_path=workflow_path,
+                    workflow_sha256=workflow_hash,
+                    workflow_snapshot=workflow,
+                )
+            )
+
+            start = time.time()
+            prompt_id: Optional[str] = None
+
+            try:
+                prompt_id = submit_workflow(
+                    comfy_url,
+                    workflow,
+                )
+
+                history = wait_for_history(
+                    comfy_url,
+                    prompt_id,
+                )
+
+                images = extract_saved_images(
+                    history,
+                    ids[
+                        "save_image"
+                    ],
+                )
+
+                if not images:
+                    raise RuntimeError(
+                        "ComfyUI completed but SaveImage returned no image."
+                    )
+
+                # Current workflow has batch_size=1, so use first result.
+                image_info = images[
+                    0
+                ]
+
+                suffix = Path(
+                    str(
+                        image_info.get(
+                            "filename",
+                            "",
+                        )
+                    )
+                ).suffix
+
+                if not suffix:
+                    suffix = ".png"
+
+                local_path = (
+                    run_dir
+                    / (
+                        f"generation_"
+                        f"{generation_id:06d}_"
+                        f"seed_{seed}"
+                        f"{suffix}"
+                    )
+                )
+
+                download_comfy_image(
+                    comfy_url,
+                    image_info,
+                    local_path,
+                )
+
+                image_hash = sha256_file(
+                    local_path
+                )
+
+                elapsed = (
+                    time.time()
+                    - start
+                )
+
+                finish_generation_row(
+                    conn,
+                    generation_id,
+                    status="completed",
+                    prompt_id=prompt_id,
+                    comfy_output=history,
+                    generated_path=(
+                        local_path
+                    ),
+                    generated_sha256=(
+                        image_hash
+                    ),
+                    elapsed_seconds=(
+                        round(
+                            elapsed,
+                            2,
+                        )
+                    ),
+                )
+
+                results.append({
+                    "generation_id": (
+                        generation_id
+                    ),
+                    "seed": seed,
+                    "image_path": str(
+                        local_path
+                    ),
+                    "elapsed_seconds": round(
+                        elapsed,
+                        2,
+                    ),
+                })
+
+                print(
+                    f"  completed -> "
+                    f"{local_path}"
+                )
+
+            except Exception as exc:
+                elapsed = (
+                    time.time()
+                    - start
+                )
+
+                finish_generation_row(
+                    conn,
+                    generation_id,
+                    status="failed",
+                    prompt_id=prompt_id,
+                    comfy_output={
+                        "error": (
+                            f"{type(exc).__name__}: "
+                            f"{exc}"
+                        )
+                    },
+                    elapsed_seconds=(
+                        round(
+                            elapsed,
+                            2,
+                        )
+                    ),
+                )
+
+                print(
+                    f"  FAILED: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+
+        print()
+        print("=" * 70)
+        print("GENERATION SUMMARY")
+        print("=" * 70)
+        print(
+            f"Completed: {len(results)} / {count}"
+        )
+
+        if results:
+            print(
+                f"Output folder: {run_dir}"
+            )
+
+        return results
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def build_parser(
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate 5 ComfyUI reconstruction candidates "
+            "from one Analyzer run_id."
+        )
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+    )
+
+    parser.add_argument(
+        "--run-id",
+        type=int,
+    )
+
+    parser.add_argument(
+        "--count",
+        type=int,
+    )
+
+    return parser
+
+
+def main(
+) -> int:
+    args = build_parser().parse_args()
+
+    cfg = load_config(
+        args.config
+    )
+
+    run_id = args.run_id
+
+    if run_id is None:
+        raw = input(
+            "请输入 analysis run_id: "
+        ).strip()
+
+        run_id = int(
+            raw
+        )
+
+    count = (
+        args.count
+        if args.count is not None
+        else int(
+            cfg.get(
+                "images_per_run",
+                5,
+            )
+        )
+    )
+
+    generate_candidates(
+        run_id=run_id,
+        count=count,
+        cfg=cfg,
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        main()
+    )

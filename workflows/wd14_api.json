@@ -1,0 +1,42 @@
+{
+  "2": {
+    "inputs": {
+      "model": "wd-v1-4-moat-tagger-v2",
+      "threshold": 0.35,
+      "character_threshold": 0.85,
+      "replace_underscore": true,
+      "trailing_comma": false,
+      "exclude_tags": "",
+      "tags": "1girl, solo, looking at viewer, smile, simple background, dress, full body, sleeveless, no humans, outstretched arms, pink dress, oekaki, spread arms",
+      "image": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "WD14Tagger|pysssss",
+    "_meta": {
+      "title": "WD14 Tagger 🐍"
+    }
+  },
+  "3": {
+    "inputs": {
+      "image": "example.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "4": {
+    "inputs": {
+      "source": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "预览任意"
+    }
+  }
+}

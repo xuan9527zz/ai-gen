@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local/private configuration
+config/generation.json
+workflows/anime.json
+.env
+
+# Models / weights
+models/
+loras/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.gguf
+*.onnx
+
+# User data / generated outputs
+data/*
+!data/.gitkeep
+generated/
+uploads/
+runs/
+*.sqlite3
+*.sqlite3-*
+*.db
+
+# Local caches
+naid_tag_cache.json
+naid_endpoint_cache.json
+illustrious_ui_state.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
