@@ -2,13 +2,14 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.0**
+当前打包版本：**v0.5.1**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
 ## 已有功能
 
 - VLM + WD14 并行图像分析
+- GIF / APNG / animated WebP 在进入 WD14 前自动取首帧
 - Danbooru Source Tags 清洗
 - Pixiv 日文 Tags 映射
 - Pixiv unknown tag → 本地 LLM 语义映射 → NAIDv3 Tag Search exact-match / Power 验证
@@ -18,6 +19,7 @@
 - BASE / REFINER 两段式 workflow
 - 3 个可开关 LoRA 槽位
 - 1 / 5 / 10 个不同 seed 候选图
+- 固定 Prompt / seed 的 A/B/C 生成质量诊断
 - 自然语言 Prompt 更正
 - Manual Positive Prompt
 - 原图 / 生成图对比
@@ -32,6 +34,7 @@ illustrious-reconstruction-studio/
 │  ├─ analyzer.py
 │  ├─ generator.py
 │  ├─ database.py
+│  ├─ image_inputs.py
 │  ├─ source_tags.py
 │  ├─ naid_verifier.py
 │  └─ web_ui.py
@@ -48,6 +51,9 @@ illustrious-reconstruction-studio/
 │  ├─ check_env.py
 │  ├─ start_studio.bat
 │  └─ start_studio.ps1
+├─ tests/
+│  ├─ test_generation_diagnostics.py
+│  └─ test_image_inputs.py
 ├─ data/                            # 数据库/原图/生成图/缓存，不提交 Git
 ├─ .gitignore
 ├─ requirements.txt
@@ -271,12 +277,27 @@ Image
 
 同一 Prompt 也可以生成多个不同 seed，并分别评分。
 
-## 9. 当前下一步
+## 9. A/B/C 生成质量诊断
+
+在 Generation Settings 中可填写一个固定 seed，然后点击 `A/B/C 质量诊断`。
+Studio 会顺序生成三张图：
+
+```text
+A = 当前 LoRA + 当前双 sampler
+B = 关闭全部 LoRA + 当前双 sampler
+C = 关闭全部 LoRA + 单 sampler（35 steps / CFG 6）
+```
+
+三张图严格共用当前 Final Prompt、seed、分辨率和 checkpoint。每条结果的
+`sampling_json` 和完整 workflow snapshot 都会写入现有 `generation_runs`，不新增或
+简化 provenance 表。候选卡片会显示 Diagnostic A / B / C 标识。
+
+## 10. 当前下一步
 
 推荐开发顺序：
 
-1. 将仓库推到 GitHub Private
-2. 用当前 10–20 张图片做一次回归测试
+1. 用当前 10–20 张图片做一次回归测试
+2. 根据 A/B/C 结果调整 LoRA / sampler / CFG 或 Analyzer style prompt
 3. 加 Tailscale 远程手机访问
 4. 改进评分 UI（最佳候选、分项评分）
 5. 统计 Prompt correction / LoRA / seed 与评分之间的关系

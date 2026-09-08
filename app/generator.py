@@ -754,6 +754,35 @@ def add_lora_chain(
     )
 
 
+def apply_sampler_overrides(
+    sampler: Dict[str, Any],
+    overrides: Dict[str, Any],
+) -> None:
+    """Apply explicit, provenance-visible KSampler input overrides."""
+
+    allowed = {
+        "steps",
+        "cfg",
+        "sampler_name",
+        "scheduler",
+        "start_at_step",
+        "end_at_step",
+        "add_noise",
+        "return_with_leftover_noise",
+    }
+
+    unknown = set(overrides) - allowed
+    if unknown:
+        raise ValueError(
+            "Unsupported sampler override(s): "
+            + ", ".join(sorted(unknown))
+        )
+
+    sampler["inputs"].update(
+        copy.deepcopy(overrides)
+    )
+
+
 def build_workflow_for_generation(
     template: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -1000,6 +1029,51 @@ def build_workflow_for_generation(
         ],
     )
 
+    sampling_mode = str(
+        cfg.get(
+            "sampling_mode",
+            "dual",
+        )
+    ).strip().lower()
+
+    if sampling_mode not in {
+        "dual",
+        "single",
+    }:
+        raise ValueError(
+            "sampling_mode must be 'dual' or 'single'."
+        )
+
+    sampling_overrides = cfg.get(
+        "sampling_overrides",
+        {},
+    )
+
+    if not isinstance(
+        sampling_overrides,
+        dict,
+    ):
+        raise ValueError(
+            "sampling_overrides must be an object."
+        )
+
+    for stage, sampler in (
+        ("base", base_sampler),
+        ("refiner", refiner_sampler),
+    ):
+        overrides = sampling_overrides.get(
+            stage,
+            {},
+        )
+        if not isinstance(overrides, dict):
+            raise ValueError(
+                f"sampling_overrides.{stage} must be an object."
+            )
+        apply_sampler_overrides(
+            sampler,
+            overrides,
+        )
+
     base_sampler[
         "inputs"
     ][
@@ -1029,6 +1103,25 @@ def build_workflow_for_generation(
     ] = int(
         seed
     )
+
+    vae_decode = validate_node(
+        workflow,
+        ids[
+            "vae_decode"
+        ],
+    )
+
+    if sampling_mode == "single":
+        # Leave the template refiner nodes intact but disconnect them from the
+        # SaveImage execution graph.  This is a true base-only sampling path.
+        vae_decode["inputs"]["samples"] = [
+            ids["base_sampler"],
+            0,
+        ]
+        vae_decode["inputs"]["vae"] = [
+            ids["base_checkpoint"],
+            2,
+        ]
 
     save_node = validate_node(
         workflow,
@@ -1063,6 +1156,7 @@ def build_workflow_for_generation(
     )
 
     sampling = {
+        "mode": sampling_mode,
         "base": {
             key: base_sampler[
                 "inputs"
@@ -1099,6 +1193,14 @@ def build_workflow_for_generation(
         },
     }
 
+    diagnostic = cfg.get(
+        "diagnostic"
+    )
+    if isinstance(diagnostic, dict):
+        sampling["diagnostic"] = copy.deepcopy(
+            diagnostic
+        )
+
     metadata = {
         "width": (
             int(
@@ -1130,6 +1232,11 @@ def build_workflow_for_generation(
         ),
         "loras": loras,
         "sampling": sampling,
+        "diagnostic": (
+            copy.deepcopy(diagnostic)
+            if isinstance(diagnostic, dict)
+            else None
+        ),
         "removed_template_loras": (
             True
         ),
@@ -1423,6 +1530,7 @@ def generate_candidates(
     count: int,
     cfg: Dict[str, Any],
     prompt_override: Optional[str] = None,
+    seeds_override: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     db_path = Path(
         cfg[
@@ -1496,15 +1604,34 @@ def generate_candidates(
             comfy_url
         )
 
-        seeds = make_seeds(
-            count,
-            str(
-                cfg.get(
-                    "seed_mode",
-                    "random",
+        if seeds_override is None:
+            seeds = make_seeds(
+                count,
+                str(
+                    cfg.get(
+                        "seed_mode",
+                        "random",
+                    )
+                ),
+            )
+        else:
+            seeds = [
+                int(seed)
+                for seed in seeds_override
+            ]
+
+            if len(seeds) != count:
+                raise ValueError(
+                    "seeds_override length must equal count."
                 )
-            ),
-        )
+
+            if any(
+                seed < 0 or seed >= 2**63
+                for seed in seeds
+            ):
+                raise ValueError(
+                    "Each seed must be between 0 and 2^63 - 1."
+                )
 
         loras = enabled_loras(
             cfg
@@ -1579,8 +1706,28 @@ def generate_candidates(
                 "%Y%m%d_%H%M%S"
             )
 
+            diagnostic_info = cfg.get(
+                "diagnostic"
+            )
+            diagnostic_variant = (
+                str(
+                    diagnostic_info.get(
+                        "variant",
+                        "",
+                    )
+                ).strip().upper()
+                if isinstance(diagnostic_info, dict)
+                else ""
+            )
+            variant_suffix = (
+                f"{diagnostic_variant.lower()}_"
+                if diagnostic_variant
+                else ""
+            )
+
             prefix = (
                 f"recon_run{run_id}_"
+                f"{variant_suffix}"
                 f"{index:02d}_seed{seed}"
             )
 
@@ -1731,6 +1878,10 @@ def generate_candidates(
                         elapsed,
                         2,
                     ),
+                    "diagnostic_variant": (
+                        diagnostic_variant
+                        or None
+                    ),
                 })
 
                 print(
@@ -1786,6 +1937,100 @@ def generate_candidates(
 
     finally:
         conn.close()
+
+
+def diagnostic_variant_configs(
+    cfg: Dict[str, Any],
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Build the controlled A/B/C configs without mutating caller state."""
+
+    def base_variant(
+        variant: str,
+        label: str,
+    ) -> Dict[str, Any]:
+        value = copy.deepcopy(cfg)
+        value["sampling_mode"] = "dual"
+        value.pop("sampling_overrides", None)
+        value["diagnostic"] = {
+            "suite": "generation_quality_abc_v1",
+            "variant": variant,
+            "label": label,
+        }
+        return value
+
+    variant_a = base_variant(
+        "A",
+        "current LoRA + dual sampler",
+    )
+
+    variant_b = base_variant(
+        "B",
+        "LoRA off + dual sampler",
+    )
+    for slot in variant_b["lora_slots"]:
+        slot["enabled"] = False
+
+    variant_c = copy.deepcopy(
+        variant_b
+    )
+    variant_c["sampling_mode"] = "single"
+    variant_c["sampling_overrides"] = {
+        "base": {
+            "steps": 35,
+            "cfg": 6.0,
+            "start_at_step": 0,
+            "end_at_step": 35,
+            "add_noise": "enable",
+            "return_with_leftover_noise": "disable",
+        }
+    }
+    variant_c["diagnostic"] = {
+        "suite": "generation_quality_abc_v1",
+        "variant": "C",
+        "label": "LoRA off + single sampler + CFG 6",
+    }
+
+    return [
+        ("A", variant_a),
+        ("B", variant_b),
+        ("C", variant_c),
+    ]
+
+
+def generate_diagnostic_abc(
+    *,
+    run_id: int,
+    cfg: Dict[str, Any],
+    prompt_override: Optional[str] = None,
+    seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Generate the controlled A/B/C quality comparison with one seed."""
+
+    fixed_seed = (
+        make_seeds(1)[0]
+        if seed is None
+        else int(seed)
+    )
+
+    results: List[Dict[str, Any]] = []
+
+    for variant, variant_cfg in diagnostic_variant_configs(
+        cfg
+    ):
+        print()
+        print(
+            f"[Diagnostic {variant}] seed={fixed_seed}"
+        )
+        generated = generate_candidates(
+            run_id=run_id,
+            count=1,
+            cfg=variant_cfg,
+            prompt_override=prompt_override,
+            seeds_override=[fixed_seed],
+        )
+        results.extend(generated)
+
+    return results
 
 
 # ============================================================

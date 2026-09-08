@@ -1,10 +1,11 @@
 [project]
 name = "illustrious-reconstruction-studio"
-version = "0.5.0"
+version = "0.5.1"
 description = "Local anime image analysis, prompt reconstruction, ComfyUI generation and human evaluation studio."
 requires-python = ">=3.10"
 dependencies = [
   "requests>=2.31,<3",
+  "Pillow>=10.1,<13",
 ]
 
 [project.scripts]

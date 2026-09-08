@@ -2244,6 +2244,7 @@ details > summary {
   bottom: 8px;
   z-index: 15;
   display: flex;
+  gap: 8px;
   justify-content: flex-end;
   pointer-events: none;
 }
@@ -2331,10 +2332,12 @@ details > summary {
     left: 10px;
     right: 10px;
     bottom: 10px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
   }
 
   .sticky-generate button {
-    width: 100%;
+    width: auto;
     min-height: 50px;
     font-size: 16px;
   }
@@ -2452,6 +2455,54 @@ def lora_summary(
 
     return " | ".join(
         parts
+    )
+
+
+def diagnostic_summary(
+    raw_json: Any,
+) -> str:
+    try:
+        sampling = json.loads(
+            raw_json
+            or "{}"
+        )
+    except Exception:
+        return ""
+
+    if not isinstance(sampling, dict):
+        return ""
+
+    diagnostic = sampling.get(
+        "diagnostic"
+    )
+    if not isinstance(diagnostic, dict):
+        return ""
+
+    variant = str(
+        diagnostic.get(
+            "variant",
+            "",
+        )
+        or ""
+    ).strip().upper()
+    label = str(
+        diagnostic.get(
+            "label",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if not variant:
+        return ""
+
+    return (
+        f"Diagnostic {variant}"
+        + (
+            f": {label}"
+            if label
+            else ""
+        )
     )
 
 
@@ -3310,6 +3361,18 @@ def page_html(
                 "</div>"
             )
 
+        diagnostic_text = diagnostic_summary(
+            row["sampling_json"]
+        )
+        diagnostic_badge = (
+            "<div class='small status-warn' "
+            "style='margin-top:5px'>"
+            f"{esc(diagnostic_text)}"
+            "</div>"
+            if diagnostic_text
+            else ""
+        )
+
         candidate_cards.append(
             f"""
             <div class="candidate">
@@ -3328,6 +3391,7 @@ def page_html(
                 Seed {esc(row['seed'])}
                 · {esc(lora_summary(row['loras_json']))}
                 · {esc(row['elapsed_seconds'])} sec
+                {diagnostic_badge}
                 {correction_badge}
 
                 <details style="margin-top:7px">
@@ -3458,6 +3522,14 @@ def page_html(
             "count",
             5,
         )
+    )
+
+    diagnostic_seed_default = str(
+        state.get(
+            "last_diagnostic_seed",
+            "",
+        )
+        or ""
     )
 
     negative_prompt = str(
@@ -3639,6 +3711,24 @@ def page_html(
                 <label>ComfyUI</label>
                 <div>{comfy_status}</div>
               </div>
+
+              <div class="field grow">
+                <label>A/B/C 固定 Seed（留空则随机）</label>
+                <input
+                  type="number"
+                  name="diagnostic_seed"
+                  min="0"
+                  max="9223372036854775807"
+                  value="{esc(diagnostic_seed_default)}"
+                  placeholder="同一 seed 生成 A / B / C"
+                >
+              </div>
+            </div>
+
+            <div class="small" style="margin-top:10px">
+              质量诊断会各生成 1 张：A 当前 LoRA + 双 sampler；
+              B 关闭 LoRA + 双 sampler；C 关闭 LoRA + 单 sampler、CFG 6。
+              三张严格共用当前 Prompt、seed、分辨率和 checkpoint。
             </div>
 
             <hr
@@ -3672,6 +3762,15 @@ def page_html(
           </div>
 
           <div class="sticky-generate">
+            <button
+              type="submit"
+              class="secondary"
+              formaction="/diagnose-generation"
+              {'disabled' if selected is None else ''}
+            >
+              A/B/C 质量诊断
+            </button>
+
             <button
               type="submit"
               {'disabled' if selected is None else ''}
@@ -4793,6 +4892,170 @@ class Handler(
                         "error": (
                             f"{type(exc).__name__}: "
                             f"{exc}"
+                        ),
+                    },
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # Controlled A/B/C generation-quality diagnostic
+        # ----------------------------------------------------
+
+        if parsed.path == "/diagnose-generation":
+            run_id = int(
+                first_value(
+                    form,
+                    "run_id",
+                )
+            )
+
+            try:
+                if not GENERATION_LOCK.acquire(
+                    blocking=False
+                ):
+                    raise RuntimeError(
+                        "已有生成任务正在运行。"
+                    )
+
+                try:
+                    cfg = config_for_form(
+                        form
+                    )
+
+                    final_prompt = first_value(
+                        form,
+                        "final_prompt_override",
+                        "",
+                    ).strip()
+                    if not final_prompt:
+                        raise ValueError(
+                            "最终 Positive Prompt 为空。"
+                        )
+
+                    raw_seed = first_value(
+                        form,
+                        "diagnostic_seed",
+                        "",
+                    ).strip()
+                    fixed_seed = (
+                        int(raw_seed)
+                        if raw_seed
+                        else generator.make_seeds(1)[0]
+                    )
+                    if fixed_seed < 0 or fixed_seed >= 2**63:
+                        raise ValueError(
+                            "Seed 必须在 0 到 2^63 - 1 之间。"
+                        )
+
+                    correction_model = first_value(
+                        form,
+                        "correction_model",
+                        DEFAULT_CORRECTION_MODEL,
+                    ).strip()
+                    user_instruction = first_value(
+                        form,
+                        "user_instruction",
+                        "",
+                    )
+                    ai_add_tags = split_prompt_fragments(
+                        first_value(
+                            form,
+                            "ai_add_tags",
+                            "",
+                        )
+                    )
+                    ai_remove_tags = split_prompt_fragments(
+                        first_value(
+                            form,
+                            "ai_remove_tags",
+                            "",
+                        )
+                    )
+                    manual_positive = first_value(
+                        form,
+                        "manual_positive",
+                        "",
+                    )
+
+                    conn = connect_db()
+                    try:
+                        analysis = get_analysis_run(
+                            conn,
+                            run_id,
+                        )
+                        if not analysis:
+                            raise ValueError(
+                                f"Run #{run_id} not found."
+                            )
+                        analyzer_prompt = str(
+                            analysis["final_prompt"]
+                            or ""
+                        )
+                    finally:
+                        conn.close()
+
+                    results = generator.generate_diagnostic_abc(
+                        run_id=run_id,
+                        cfg=cfg,
+                        prompt_override=final_prompt,
+                        seed=fixed_seed,
+                    )
+
+                    for result in results:
+                        variant = str(
+                            result.get(
+                                "diagnostic_variant",
+                                "unknown",
+                            )
+                        ).lower()
+                        save_prompt_edit_records(
+                            [result],
+                            parent_generation_id=None,
+                            edit_kind=f"diagnostic_{variant}",
+                            base_prompt=analyzer_prompt,
+                            user_instruction=user_instruction,
+                            correction_model=correction_model,
+                            ai_add_tags=ai_add_tags,
+                            ai_remove_tags=ai_remove_tags,
+                            manual_positive=manual_positive,
+                            final_prompt=final_prompt,
+                        )
+
+                    state = load_ui_state(
+                        load_base_config()
+                    )
+                    state.update({
+                        "lora_slots": cfg["lora_slots"],
+                        "negative_prompt": cfg["negative_prompt"],
+                        "last_run_id": run_id,
+                        "last_diagnostic_seed": fixed_seed,
+                        "correction_model": correction_model,
+                    })
+                    save_ui_state(state)
+
+                finally:
+                    GENERATION_LOCK.release()
+
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": run_id,
+                        "message": (
+                            "A/B/C diagnostic completed: "
+                            f"{len(results)}/3 · seed {fixed_seed}"
+                        ),
+                    },
+                )
+
+            except Exception as exc:
+                traceback.print_exc()
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": run_id,
+                        "error": (
+                            f"{type(exc).__name__}: {exc}"
                         ),
                     },
                 )

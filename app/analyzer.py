@@ -79,6 +79,8 @@ from .naid_verifier import (
     resolve_pixiv_unknown_tags,
 )
 
+from .image_inputs import prepare_wd14_image
+
 
 # ============================================================
 # CONFIG
@@ -1392,13 +1394,26 @@ def extract_wd14_tags(
     return None
 
 
-def run_wd14(image_path):
+def run_wd14_with_metadata(image_path):
     print("[WD14] 开始分析图片...")
     start = time.time()
 
-    uploaded_name = upload_to_comfy(
+    with prepare_wd14_image(
         image_path
-    )
+    ) as (wd14_path, input_metadata):
+        if input_metadata[
+            "strategy"
+        ] == "first_frame_png":
+            print(
+                "[WD14] 检测到动画图片："
+                f"{input_metadata['source_format']} / "
+                f"{input_metadata['source_frame_count']} frames；"
+                "仅使用第 1 帧。"
+            )
+
+        uploaded_name = upload_to_comfy(
+            wd14_path
+        )
 
     workflow = load_wd14_workflow()
 
@@ -1428,13 +1443,25 @@ def run_wd14(image_path):
                 f"{elapsed:.1f} 秒"
             )
 
-            return tags.strip()
+            return (
+                tags.strip(),
+                input_metadata,
+            )
 
         time.sleep(1)
 
     raise TimeoutError(
         "WD14 处理超过 180 秒。"
     )
+
+
+def run_wd14(image_path):
+    """Backward-compatible WD14 entry point returning tags only."""
+
+    tags, _metadata = run_wd14_with_metadata(
+        image_path
+    )
+    return tags
 
 
 # ============================================================
@@ -3042,7 +3069,7 @@ def analyze_image(
 
             wd14_future = (
                 executor.submit(
-                    run_wd14,
+                    run_wd14_with_metadata,
                     str(image_path),
                 )
             )
@@ -3051,7 +3078,10 @@ def analyze_image(
                 vlm_future.result()
             )
 
-            wd14_tags = (
+            (
+                wd14_tags,
+                wd14_input,
+            ) = (
                 wd14_future.result()
             )
 
@@ -3060,8 +3090,11 @@ def analyze_image(
             str(image_path)
         )
 
-        wd14_tags = run_wd14(
-            str(image_path)
+        (
+            wd14_tags,
+            wd14_input,
+        ) = run_wd14_with_metadata(
+            str(image_path),
         )
 
     # --------------------------------------------------------
@@ -3510,6 +3543,7 @@ def analyze_image(
         },
         "vlm_caption": vlm_caption,
         "wd14_tags": wd14_tags,
+        "wd14_input": wd14_input,
         "merger_data": merger_data,
         "normalizer": {
             "multi_subject_detected": (
