@@ -2,13 +2,14 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.2**
+当前打包版本：**v0.5.3**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
 ## 已有功能
 
 - VLM + WD14 并行图像分析
+- VLM 风格、渲染、材质与光照词的确定性漏项恢复
 - GIF / APNG / animated WebP 在进入 WD14 前自动取首帧
 - Danbooru Source Tags 清洗
 - Pixiv 日文 Tags 映射
@@ -277,6 +278,16 @@ Image
 
 同一 Prompt 也可以生成多个不同 seed，并分别评分。
 
+Analyzer v2.5.1 会在 run JSON / SQLite `raw_json` 中分别保留：
+
+```text
+visual_features_model_raw       = merger 模型提取结果
+visual_features_deterministic   = 从 VLM 原文确定性恢复的漏项（含 origin / evidence）
+visual_features_raw             = 两者合并后的过滤输入
+```
+
+确定性恢复只接受 VLM 明确出现的短语，并排除 `no bokeh` 等否定语境。
+
 ## 9. A–E 生成质量诊断
 
 在 Generation Settings 中可填写一个固定 seed，然后点击 `A–E 质量诊断`。
@@ -301,8 +312,8 @@ E = D + 按原图纵横比自动拟合分辨率
 推荐开发顺序：
 
 1. 用当前 10–20 张图片重复 A–E 回归测试
-2. 把 VLM 的 style / rendering / lighting / materials 更可靠地保留到 Final Prompt
-3. 评估将单 sampler、CFG 6 和原图纵横比作为可选生成 preset
+2. 比较 Analyzer 动态风格词与 D/E 固定加权风格 preset 的评分
+3. 评估将单 sampler、CFG 6、风格增强和原图纵横比做成生成 preset
 4. 改进评分 UI（最佳候选、分项评分）
 5. 统计 Prompt correction / LoRA / seed 与评分之间的关系
 6. 后续再考虑参考图 conditioning、RAG / preference learning

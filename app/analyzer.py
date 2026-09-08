@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Illustrious Image Analyzer / Orchestrator V2.4.0
+Illustrious Image Analyzer / Orchestrator V2.5.1
+
+V2.5.1 visual-style retention:
+- Requires the merger to cover every explicitly described high-level category.
+- Adds conservative deterministic recovery for rendering, material, lighting,
+  depth-of-field and atmosphere phrases that are explicit in the VLM caption.
+- Rejects rule matches in negated contexts such as "no bokeh".
+- Records model-extracted and deterministically recovered features separately.
 
 V2.4.0 Pixiv unknown-tag verification:
 - WD14 remains the conservative base evidence.
@@ -283,6 +290,18 @@ Each visual feature tag must:
 - ideally be 1 to 5 words
 - not be a sentence
 - not merely restate WD14 body/clothing/hair/pose attributes
+
+CATEGORY COVERAGE IS REQUIRED:
+- Inspect the complete VLM caption before finishing visual_features.
+- For every allowed category explicitly described by the VLM, include at least
+  one discriminative feature from that category.
+- In particular, do not omit rendering or material features when the caption
+  describes painterly / realistic / cel-shaded rendering, surface texture,
+  fabric texture, glossy surfaces, or similar appearance cues.
+- Prefer 1 to 3 useful features per explicitly described category.
+- Preserve meaningful qualifiers. For example, use "painterly rendering" or
+  "realistic illustration", not the vague tag "detailed style".
+- Do not stop after a fixed total number of features.
 
 GOOD examples:
 {"category":"composition","tag":"centered composition"}
@@ -856,6 +875,186 @@ GENERIC_VISUAL_FILLER = {
 }
 
 
+# Conservative caption-to-feature recovery. These rules do not attempt to
+# reinterpret the scene; they only preserve high-level phrases explicitly
+# present in the VLM caption when the merger model omits them.
+CAPTION_VISUAL_RULES = (
+    (
+        "rendering",
+        "semi-realistic illustration",
+        (r"\bsemi[- ]realistic\b",),
+    ),
+    (
+        "rendering",
+        "photorealistic rendering",
+        (r"\bphoto[- ]?realistic\b", r"\bphotorealism\b"),
+    ),
+    (
+        "rendering",
+        "realistic illustration",
+        (
+            r"\b(?:illustration|art|rendering) style\b[^.]{0,80}\brealistic\b",
+            r"\brealistic (?:illustration|rendering|art style)\b",
+        ),
+    ),
+    (
+        "rendering",
+        "highly detailed illustration",
+        (r"\bhighly detailed\b", r"\brich in detail\b"),
+    ),
+    (
+        "rendering",
+        "painterly rendering",
+        (r"\bpainterly\b",),
+    ),
+    (
+        "rendering",
+        "digital painting",
+        (r"\bdigital painting\b", r"\bdigitally painted\b"),
+    ),
+    (
+        "rendering",
+        "cel shading",
+        (r"\bcel[- ]shad(?:ed|ing)\b",),
+    ),
+    (
+        "rendering",
+        "anime illustration",
+        (r"\banime (?:style|illustration|aesthetic)\b",),
+    ),
+    (
+        "rendering",
+        "watercolor illustration",
+        (r"\bwatercolou?r\b",),
+    ),
+    (
+        "rendering",
+        "oil painting",
+        (r"\boil painting\b",),
+    ),
+    (
+        "rendering",
+        "3d rendering",
+        (r"\b3d render(?:ing|ed)?\b",),
+    ),
+    (
+        "rendering",
+        "soft shading",
+        (r"\bsoft shading\b",),
+    ),
+    (
+        "material",
+        "detailed fabric texture",
+        (
+            r"\bfabric texture(?:s)?\b",
+            r"\btexture(?:s)? of (?:the )?fabric\b",
+        ),
+    ),
+    (
+        "material",
+        "intricate lace texture",
+        (r"\b(?:intricate|delicate) lace (?:pattern|texture)(?:s)?\b",),
+    ),
+    (
+        "material",
+        "woven texture",
+        (
+            r"\bwoven texture\b",
+            r"\btexture of (?:the )?woven\b",
+        ),
+    ),
+    (
+        "material",
+        "glossy skin",
+        (r"\bglossy skin\b", r"\bskin (?:appears|looks) glossy\b"),
+    ),
+    (
+        "material",
+        "subsurface scattering",
+        (r"\bsubsurface scattering\b",),
+    ),
+    (
+        "lighting",
+        "soft diffused lighting",
+        (
+            r"\bsoft(?: and)? diffused light(?:ing)?\b",
+            r"\blighting is soft and diffused\b",
+        ),
+    ),
+    (
+        "lighting",
+        "warm golden lighting",
+        (r"\bwarm(?:,| and)? golden (?:light|lighting|glow)\b",),
+    ),
+    (
+        "lighting",
+        "volumetric lighting",
+        (r"\bvolumetric light(?:ing)?\b",),
+    ),
+    (
+        "lighting",
+        "soft bloom",
+        (r"\bsoft bloom\b",),
+    ),
+    (
+        "lighting",
+        "subtle shadows",
+        (r"\bsubtle shadows\b",),
+    ),
+    (
+        "lighting",
+        "dramatic shadows",
+        (r"\bdramatic shadows\b",),
+    ),
+    (
+        "lighting",
+        "rim lighting",
+        (r"\brim light(?:ing)?\b",),
+    ),
+    (
+        "lighting",
+        "backlighting",
+        (r"\bback[- ]?light(?:ing|lit)?\b",),
+    ),
+    (
+        "depth_of_field",
+        "shallow depth of field",
+        (r"\bshallow depth of field\b",),
+    ),
+    (
+        "depth_of_field",
+        "slightly blurred background",
+        (
+            r"\bslightly blurred background\b",
+            r"\bbackground (?:is |remains )?slightly blurred\b",
+        ),
+    ),
+    (
+        "depth_of_field",
+        "blurred background",
+        (
+            r"(?<!slightly )(?<!softly )\bblurred background\b",
+            r"\bbackground (?:is |remains )?blurred\b",
+        ),
+    ),
+    (
+        "depth_of_field",
+        "bokeh",
+        (r"\bbokeh\b",),
+    ),
+    (
+        "atmosphere",
+        "ethereal atmosphere",
+        (r"\bethereal atmosphere\b",),
+    ),
+    (
+        "atmosphere",
+        "dreamy atmosphere",
+        (r"\bdreamy atmosphere\b",),
+    ),
+)
+
+
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -1061,6 +1260,127 @@ def contains_low_level_term(tag):
     return False
 
 
+def extract_caption_visual_features(caption):
+    """Recover explicit high-level visual cues from a VLM caption."""
+
+    text = " ".join(
+        str(caption or "").lower().split()
+    )
+    features = []
+
+    if not text:
+        return features
+
+    for category, tag, patterns in CAPTION_VISUAL_RULES:
+        match = None
+
+        for pattern in patterns:
+            for candidate in re.finditer(
+                pattern,
+                text,
+                flags=re.IGNORECASE,
+            ):
+                if not caption_match_is_negated(
+                    text,
+                    candidate,
+                ):
+                    match = candidate
+                    break
+            if match is not None:
+                break
+
+        if not match:
+            continue
+
+        features.append({
+            "category": category,
+            "tag": tag,
+            "origin": "vlm_caption_rule",
+            "evidence": " ".join(
+                match.group(0).split()
+            ),
+        })
+
+    return features
+
+
+def caption_match_is_negated(text, match):
+    """Detect a local explicit negation around one caption rule match."""
+
+    left = text[
+        max(0, match.start() - 100):match.start()
+    ]
+    right = text[
+        match.end():min(len(text), match.end() + 50)
+    ]
+    left_clause = re.split(
+        r"[.,;!?]|\bbut\b|\bhowever\b",
+        left,
+    )[-1]
+
+    if re.search(
+        r"\b(?:no|not|without|lacks?|lacking|absence of)\b"
+        r"[^.;]{0,80}$",
+        left_clause,
+    ):
+        return True
+
+    if re.match(
+        r"\s+(?:effects? )?(?:is |are )?"
+        r"(?:absent|missing|not visible)\b",
+        right,
+    ):
+        return True
+
+    return False
+
+
+def visual_feature_dedupe_key(item):
+    category = str(
+        item.get("category", "")
+    ).strip().lower()
+    tag = canonicalize_tag(
+        item.get("tag", "")
+    )
+
+    if category == "rendering":
+        tag = re.sub(
+            r"\s+style$",
+            "",
+            tag,
+        )
+
+    return category, tag
+
+
+def combine_visual_features(*feature_groups):
+    """Combine feature groups while preserving first-source provenance."""
+
+    combined = []
+    seen = set()
+
+    for group in feature_groups:
+        if not isinstance(group, list):
+            continue
+
+        for item in group:
+            if not isinstance(item, dict):
+                combined.append(item)
+                continue
+
+            key = visual_feature_dedupe_key(
+                item
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            combined.append(item)
+
+    return combined
+
+
 def sanitize_visual_features(features):
     """
     Strong V2.2 gate.
@@ -1149,10 +1469,26 @@ def sanitize_visual_features(features):
             continue
 
         accepted_tags.append(tag)
-        accepted_features.append({
+        accepted_feature = {
             "category": category,
             "tag": tag,
-        })
+        }
+
+        origin = str(
+            item.get("origin", "")
+        ).strip()
+        evidence = str(
+            item.get("evidence", "")
+        ).strip()
+
+        if origin:
+            accepted_feature["origin"] = origin
+        if evidence:
+            accepted_feature["evidence"] = evidence
+
+        accepted_features.append(
+            accepted_feature
+        )
 
     accepted_tags = exact_deduplicate(
         accepted_tags
@@ -2658,10 +2994,27 @@ Return structured JSON only.
         "review_reasons"
     ] = review_reasons
 
-    # Keep raw VLM features for audit.
-    raw_visual_features = list(
+    # Keep model and deterministic VLM features separately for audit.
+    model_visual_features = list(
         merger_data["visual_features"]
     )
+    deterministic_visual_features = (
+        extract_caption_visual_features(
+            vlm_caption
+        )
+    )
+    raw_visual_features = combine_visual_features(
+        model_visual_features,
+        deterministic_visual_features,
+    )
+
+    merger_data[
+        "visual_features_model_raw"
+    ] = model_visual_features
+
+    merger_data[
+        "visual_features_deterministic"
+    ] = deterministic_visual_features
 
     (
         accepted_tags,
@@ -3043,7 +3396,7 @@ def analyze_image(
     print()
     print("=" * 60)
     print(
-        "Illustrious Image Analyzer V2.4.0"
+        "Illustrious Image Analyzer V2.5.1"
     )
     print("=" * 60)
     print(f"图片：{image_path}")
@@ -3501,7 +3854,7 @@ def analyze_image(
         "timestamp": time.strftime(
             "%Y-%m-%d %H:%M:%S"
         ),
-        "version": "2.4.0",
+        "version": "2.5.1",
         "models": {
             "vlm": VLM_MODEL,
             "merger": MERGER_MODEL,
