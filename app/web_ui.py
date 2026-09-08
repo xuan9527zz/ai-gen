@@ -3713,22 +3713,24 @@ def page_html(
               </div>
 
               <div class="field grow">
-                <label>A/B/C 固定 Seed（留空则随机）</label>
+                <label>A–E 固定 Seed（留空则随机）</label>
                 <input
                   type="number"
                   name="diagnostic_seed"
                   min="0"
                   max="9223372036854775807"
                   value="{esc(diagnostic_seed_default)}"
-                  placeholder="同一 seed 生成 A / B / C"
+                  placeholder="同一 seed 生成 A / B / C / D / E"
                 >
               </div>
             </div>
 
             <div class="small" style="margin-top:10px">
               质量诊断会各生成 1 张：A 当前 LoRA + 双 sampler；
-              B 关闭 LoRA + 双 sampler；C 关闭 LoRA + 单 sampler、CFG 6。
-              三张严格共用当前 Prompt、seed、分辨率和 checkpoint。
+              B 关闭 LoRA + 双 sampler；C 关闭 LoRA + 单 sampler、CFG 6；
+              D 在 C 上追加半写实绘画式风格词；E 在 D 上改用原图纵横比。
+              A–C 共用原 Prompt 和分辨率；D 只改变风格词；E 只再改变分辨率。
+              五张共用 seed 和 checkpoint。
             </div>
 
             <hr
@@ -3768,7 +3770,7 @@ def page_html(
               formaction="/diagnose-generation"
               {'disabled' if selected is None else ''}
             >
-              A/B/C 质量诊断
+              A–E 质量诊断
             </button>
 
             <button
@@ -4899,7 +4901,7 @@ class Handler(
             return
 
         # ----------------------------------------------------
-        # Controlled A/B/C generation-quality diagnostic
+        # Controlled A-E generation-quality diagnostic
         # ----------------------------------------------------
 
         if parsed.path == "/diagnose-generation":
@@ -4995,7 +4997,7 @@ class Handler(
                     finally:
                         conn.close()
 
-                    results = generator.generate_diagnostic_abc(
+                    results = generator.generate_diagnostic_abcde(
                         run_id=run_id,
                         cfg=cfg,
                         prompt_override=final_prompt,
@@ -5019,7 +5021,12 @@ class Handler(
                             ai_add_tags=ai_add_tags,
                             ai_remove_tags=ai_remove_tags,
                             manual_positive=manual_positive,
-                            final_prompt=final_prompt,
+                            final_prompt=str(
+                                result.get(
+                                    "prompt",
+                                    final_prompt,
+                                )
+                            ),
                         )
 
                     state = load_ui_state(
@@ -5042,8 +5049,8 @@ class Handler(
                     {
                         "run_id": run_id,
                         "message": (
-                            "A/B/C diagnostic completed: "
-                            f"{len(results)}/3 · seed {fixed_seed}"
+                            "A–E diagnostic completed: "
+                            f"{len(results)}/5 · seed {fixed_seed}"
                         ),
                     },
                 )

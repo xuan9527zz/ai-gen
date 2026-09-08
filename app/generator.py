@@ -56,6 +56,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import math
 import mimetypes
 import secrets
 import sqlite3
@@ -67,13 +68,23 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "generation.json"
 
-GENERATOR_VERSION = "1.1"
+GENERATOR_VERSION = "1.2"
+
+DIAGNOSTIC_STYLE_PROMPT = (
+    "(semi-realistic illustration:1.2), "
+    "(highly detailed digital painting:1.2), "
+    "soft realistic rendering, painterly shading, "
+    "realistic skin shading, intricate fabric texture, "
+    "volumetric lighting, soft bloom, "
+    "cinematic depth of field"
+)
 
 
 # ============================================================
@@ -783,6 +794,177 @@ def apply_sampler_overrides(
     )
 
 
+def append_generation_prompt(
+    prompt: str,
+    cfg: Dict[str, Any],
+) -> str:
+    suffix = str(
+        cfg.get(
+            "positive_prompt_append",
+            "",
+        )
+        or ""
+    ).strip(" ,\n\t")
+
+    if not suffix:
+        return prompt.strip()
+
+    return (
+        prompt.strip(" ,\n\t")
+        + ", "
+        + suffix
+    )
+
+
+def fit_source_resolution(
+    source_width: int,
+    source_height: int,
+    *,
+    target_pixels: int,
+    multiple: int = 64,
+    min_dimension: int = 512,
+    max_dimension: int = 1536,
+) -> Tuple[int, int]:
+    """Fit source aspect ratio near a fixed pixel budget."""
+
+    if source_width < 1 or source_height < 1:
+        raise ValueError(
+            "Source dimensions must be positive."
+        )
+    if target_pixels < 1 or multiple < 1:
+        raise ValueError(
+            "target_pixels and multiple must be positive."
+        )
+
+    scale = math.sqrt(
+        target_pixels
+        / (source_width * source_height)
+    )
+
+    width = int(
+        round(
+            source_width * scale / multiple
+        )
+        * multiple
+    )
+    height = int(
+        round(
+            source_height * scale / multiple
+        )
+        * multiple
+    )
+
+    width = min(
+        max(width, min_dimension),
+        max_dimension,
+    )
+    height = min(
+        max(height, min_dimension),
+        max_dimension,
+    )
+
+    return width, height
+
+
+def resolve_resolution_config(
+    cfg: Dict[str, Any],
+    template: Dict[str, Any],
+    *,
+    source_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Resolve workflow/fixed/source resolution into an effective config."""
+
+    resolved = copy.deepcopy(cfg)
+    raw = resolved.get(
+        "resolution",
+        {"mode": "workflow"},
+    )
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "resolution must be an object."
+        )
+
+    mode = str(
+        raw.get(
+            "mode",
+            "workflow",
+        )
+    ).strip().lower()
+
+    if mode == "workflow":
+        resolved["resolution"] = {
+            "mode": "workflow"
+        }
+        return resolved
+
+    if mode == "fixed":
+        width = int(raw.get("width", 0))
+        height = int(raw.get("height", 0))
+        if width < 64 or height < 64:
+            raise ValueError(
+                "Fixed resolution requires positive width and height."
+            )
+        resolved["resolution"] = {
+            "mode": "fixed",
+            "width": width,
+            "height": height,
+        }
+        return resolved
+
+    if mode != "source":
+        raise ValueError(
+            "resolution.mode must be workflow, fixed, or source."
+        )
+
+    if source_path is None or not source_path.exists():
+        raise FileNotFoundError(
+            f"Source image not found for resolution fitting: {source_path}"
+        )
+
+    latent_id = str(
+        resolved["workflow_nodes"]["latent"]
+    )
+    latent = validate_node(
+        template,
+        latent_id,
+        "EmptyLatentImage",
+    )
+    workflow_width = int(
+        latent["inputs"].get("width", 1024)
+    )
+    workflow_height = int(
+        latent["inputs"].get("height", 1024)
+    )
+
+    with Image.open(source_path) as image:
+        source_width, source_height = image.size
+
+    multiple = int(raw.get("multiple", 64))
+    width, height = fit_source_resolution(
+        source_width,
+        source_height,
+        target_pixels=(
+            workflow_width
+            * workflow_height
+        ),
+        multiple=multiple,
+    )
+
+    resolved["resolution"] = {
+        "mode": "source",
+        "width": width,
+        "height": height,
+        "source_width": source_width,
+        "source_height": source_height,
+        "target_pixels": (
+            workflow_width
+            * workflow_height
+        ),
+        "multiple": multiple,
+    }
+    return resolved
+
+
 def build_workflow_for_generation(
     template: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -1143,6 +1325,32 @@ def build_workflow_for_generation(
         ],
     )
 
+    resolution = cfg.get(
+        "resolution",
+        {"mode": "workflow"},
+    )
+    resolution_mode = str(
+        resolution.get(
+            "mode",
+            "workflow",
+        )
+    ).strip().lower()
+
+    if resolution_mode in {
+        "fixed",
+        "source",
+    }:
+        latent["inputs"]["width"] = int(
+            resolution["width"]
+        )
+        latent["inputs"]["height"] = int(
+            resolution["height"]
+        )
+    elif resolution_mode != "workflow":
+        raise ValueError(
+            "resolution.mode must be workflow, fixed, or source."
+        )
+
     width = latent[
         "inputs"
     ].get(
@@ -1157,6 +1365,31 @@ def build_workflow_for_generation(
 
     sampling = {
         "mode": sampling_mode,
+        "resolution": {
+            "mode": resolution_mode,
+            "width": (
+                int(width)
+                if width is not None
+                else None
+            ),
+            "height": (
+                int(height)
+                if height is not None
+                else None
+            ),
+            **(
+                {
+                    key: resolution[key]
+                    for key in (
+                        "source_width",
+                        "source_height",
+                        "target_pixels",
+                        "multiple",
+                    )
+                    if key in resolution
+                }
+            ),
+        },
         "base": {
             key: base_sampler[
                 "inputs"
@@ -1232,6 +1465,9 @@ def build_workflow_for_generation(
         ),
         "loras": loras,
         "sampling": sampling,
+        "resolution": copy.deepcopy(
+            sampling["resolution"]
+        ),
         "diagnostic": (
             copy.deepcopy(diagnostic)
             if isinstance(diagnostic, dict)
@@ -1591,6 +1827,23 @@ def generate_candidates(
             workflow_path
         )
 
+        cfg = resolve_resolution_config(
+            cfg,
+            template,
+            source_path=Path(
+                str(
+                    analysis[
+                        "first_seen_path"
+                    ]
+                )
+            ),
+        )
+
+        prompt = append_generation_prompt(
+            prompt,
+            cfg,
+        )
+
         workflow_hash = sha256_file(
             workflow_path
         )
@@ -1871,6 +2124,7 @@ def generate_candidates(
                         generation_id
                     ),
                     "seed": seed,
+                    "prompt": prompt,
                     "image_path": str(
                         local_path
                     ),
@@ -1942,7 +2196,7 @@ def generate_candidates(
 def diagnostic_variant_configs(
     cfg: Dict[str, Any],
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """Build the controlled A/B/C configs without mutating caller state."""
+    """Build the controlled A-E configs without mutating caller state."""
 
     def base_variant(
         variant: str,
@@ -1951,8 +2205,9 @@ def diagnostic_variant_configs(
         value = copy.deepcopy(cfg)
         value["sampling_mode"] = "dual"
         value.pop("sampling_overrides", None)
+        value.pop("positive_prompt_append", None)
         value["diagnostic"] = {
-            "suite": "generation_quality_abc_v1",
+            "suite": "generation_quality_abcde_v1",
             "variant": variant,
             "label": label,
         }
@@ -1985,26 +2240,54 @@ def diagnostic_variant_configs(
         }
     }
     variant_c["diagnostic"] = {
-        "suite": "generation_quality_abc_v1",
+        "suite": "generation_quality_abcde_v1",
         "variant": "C",
         "label": "LoRA off + single sampler + CFG 6",
+    }
+
+    variant_d = copy.deepcopy(
+        variant_c
+    )
+    variant_d["positive_prompt_append"] = (
+        DIAGNOSTIC_STYLE_PROMPT
+    )
+    variant_d["diagnostic"] = {
+        "suite": "generation_quality_abcde_v1",
+        "variant": "D",
+        "label": "C + semi-realistic painterly style prompt",
+    }
+
+    variant_e = copy.deepcopy(
+        variant_d
+    )
+    variant_e["resolution"] = {
+        "mode": "source",
+        "multiple": 64,
+    }
+    variant_e["diagnostic"] = {
+        "suite": "generation_quality_abcde_v1",
+        "variant": "E",
+        "label": "D + source aspect-ratio resolution",
     }
 
     return [
         ("A", variant_a),
         ("B", variant_b),
         ("C", variant_c),
+        ("D", variant_d),
+        ("E", variant_e),
     ]
 
 
-def generate_diagnostic_abc(
+def generate_diagnostic_abcde(
     *,
     run_id: int,
     cfg: Dict[str, Any],
     prompt_override: Optional[str] = None,
     seed: Optional[int] = None,
+    variants: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Generate the controlled A/B/C quality comparison with one seed."""
+    """Generate a controlled A-E comparison with one fixed seed."""
 
     fixed_seed = (
         make_seeds(1)[0]
@@ -2014,9 +2297,15 @@ def generate_diagnostic_abc(
 
     results: List[Dict[str, Any]] = []
 
-    for variant, variant_cfg in diagnostic_variant_configs(
-        cfg
-    ):
+    selected = (
+        {value.upper() for value in variants}
+        if variants is not None
+        else None
+    )
+
+    for variant, variant_cfg in diagnostic_variant_configs(cfg):
+        if selected is not None and variant not in selected:
+            continue
         print()
         print(
             f"[Diagnostic {variant}] seed={fixed_seed}"
@@ -2031,6 +2320,24 @@ def generate_diagnostic_abc(
         results.extend(generated)
 
     return results
+
+
+def generate_diagnostic_abc(
+    *,
+    run_id: int,
+    cfg: Dict[str, Any],
+    prompt_override: Optional[str] = None,
+    seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Backward-compatible A/B/C-only diagnostic entry point."""
+
+    return generate_diagnostic_abcde(
+        run_id=run_id,
+        cfg=cfg,
+        prompt_override=prompt_override,
+        seed=seed,
+        variants=["A", "B", "C"],
+    )
 
 
 # ============================================================

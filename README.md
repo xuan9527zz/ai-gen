@@ -2,7 +2,7 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.1**
+当前打包版本：**v0.5.2**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
@@ -19,7 +19,7 @@
 - BASE / REFINER 两段式 workflow
 - 3 个可开关 LoRA 槽位
 - 1 / 5 / 10 个不同 seed 候选图
-- 固定 Prompt / seed 的 A/B/C 生成质量诊断
+- 固定 Prompt / seed 的 A–E 生成质量诊断
 - 自然语言 Prompt 更正
 - Manual Positive Prompt
 - 原图 / 生成图对比
@@ -277,31 +277,37 @@ Image
 
 同一 Prompt 也可以生成多个不同 seed，并分别评分。
 
-## 9. A/B/C 生成质量诊断
+## 9. A–E 生成质量诊断
 
-在 Generation Settings 中可填写一个固定 seed，然后点击 `A/B/C 质量诊断`。
-Studio 会顺序生成三张图：
+在 Generation Settings 中可填写一个固定 seed，然后点击 `A–E 质量诊断`。
+Studio 会顺序生成五张图：
 
 ```text
 A = 当前 LoRA + 当前双 sampler
 B = 关闭全部 LoRA + 当前双 sampler
 C = 关闭全部 LoRA + 单 sampler（35 steps / CFG 6）
+D = C + 半写实、高细节、绘画式渲染提示词
+E = D + 按原图纵横比自动拟合分辨率
 ```
 
-三张图严格共用当前 Final Prompt、seed、分辨率和 checkpoint。每条结果的
+五张图严格共用 seed 和 checkpoint。A–C 共用当前 Final Prompt 和 workflow
+分辨率，D 只追加固定的风格提示词，E 只在 D 的基础上按原图纵横比调整分辨率。
+每条结果的
 `sampling_json` 和完整 workflow snapshot 都会写入现有 `generation_runs`，不新增或
-简化 provenance 表。候选卡片会显示 Diagnostic A / B / C 标识。
+简化 provenance 表。候选卡片会显示 Diagnostic A–E 标识。
 
 ## 10. 当前下一步
 
 推荐开发顺序：
 
-1. 用当前 10–20 张图片做一次回归测试
-2. 根据 A/B/C 结果调整 LoRA / sampler / CFG 或 Analyzer style prompt
-3. 加 Tailscale 远程手机访问
+1. 用当前 10–20 张图片重复 A–E 回归测试
+2. 把 VLM 的 style / rendering / lighting / materials 更可靠地保留到 Final Prompt
+3. 评估将单 sampler、CFG 6 和原图纵横比作为可选生成 preset
 4. 改进评分 UI（最佳候选、分项评分）
 5. 统计 Prompt correction / LoRA / seed 与评分之间的关系
-6. 后续再考虑 RAG / preference learning
+6. 后续再考虑参考图 conditioning、RAG / preference learning
+
+当前远程访问维持同一局域网模式，不直接向公网暴露 Studio 端口。
 
 ## License
 

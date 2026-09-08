@@ -1,6 +1,9 @@
 import copy
+import tempfile
 import unittest
 from pathlib import Path
+
+from PIL import Image
 
 from app import generator
 
@@ -36,6 +39,13 @@ class GenerationDiagnosticTests(unittest.TestCase):
         self.assertTrue(variants["A"]["lora_slots"][0]["enabled"])
         self.assertFalse(variants["B"]["lora_slots"][0]["enabled"])
         self.assertFalse(variants["C"]["lora_slots"][0]["enabled"])
+        self.assertFalse(variants["D"]["lora_slots"][0]["enabled"])
+        self.assertFalse(variants["E"]["lora_slots"][0]["enabled"])
+        self.assertEqual(
+            variants["D"]["positive_prompt_append"],
+            generator.DIAGNOSTIC_STYLE_PROMPT,
+        )
+        self.assertEqual(variants["E"]["resolution"]["mode"], "source")
 
     def test_single_sampler_variant_bypasses_refiner(self):
         variants = dict(
@@ -81,6 +91,50 @@ class GenerationDiagnosticTests(unittest.TestCase):
             workflow[ids["vae_decode"]]["inputs"]["samples"],
             [ids["refiner_sampler"], 0],
         )
+
+    def test_source_resolution_preserves_portrait_aspect_ratio(self):
+        self.assertEqual(
+            generator.fit_source_resolution(
+                853,
+                1280,
+                target_pixels=1024 * 1024,
+            ),
+            (832, 1280),
+        )
+
+    def test_variant_e_resolves_source_dimensions_and_provenance(self):
+        variants = dict(
+            generator.diagnostic_variant_configs(self.cfg)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "portrait.png"
+            Image.new("RGB", (853, 1280)).save(source_path)
+            resolved = generator.resolve_resolution_config(
+                variants["E"],
+                self.template,
+                source_path=source_path,
+            )
+
+        prompt = generator.append_generation_prompt(
+            "1girl",
+            resolved,
+        )
+        workflow, metadata = generator.build_workflow_for_generation(
+            self.template,
+            resolved,
+            prompt=prompt,
+            seed=123,
+            filename_prefix="test",
+        )
+        latent_id = resolved["workflow_nodes"]["latent"]
+
+        self.assertEqual(prompt, f"1girl, {generator.DIAGNOSTIC_STYLE_PROMPT}")
+        self.assertEqual(workflow[latent_id]["inputs"]["width"], 832)
+        self.assertEqual(workflow[latent_id]["inputs"]["height"], 1280)
+        self.assertEqual(metadata["resolution"]["mode"], "source")
+        self.assertEqual(metadata["resolution"]["source_width"], 853)
+        self.assertEqual(metadata["resolution"]["source_height"], 1280)
 
 
 if __name__ == "__main__":
