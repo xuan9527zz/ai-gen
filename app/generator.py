@@ -76,7 +76,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "generation.json"
 
-GENERATOR_VERSION = "1.4"
+GENERATOR_VERSION = "1.5"
 
 DIAGNOSTIC_STYLE_PROMPT = (
     "(semi-realistic illustration:1.2), "
@@ -101,6 +101,23 @@ GENERATION_PRESETS = {
         "description": "平衡重建设置，并追加加权的半写实绘画式风格提示词。",
     },
 }
+
+GENERATION_MODES = {
+    "text2img": {
+        "label": "Text2img",
+        "description": "仅使用 Prompt 生成。",
+    },
+    "img2img": {
+        "label": "Img2img（推荐）",
+        "description": (
+            "使用原图第一帧作为 latent；采用已验证的半写实单 sampler 配方。"
+        ),
+    },
+}
+
+DEFAULT_IMG2IMG_DENOISE = 0.60
+MIN_UI_IMG2IMG_DENOISE = 0.50
+MAX_UI_IMG2IMG_DENOISE = 0.70
 
 
 # ============================================================
@@ -292,6 +309,63 @@ def apply_generation_preset(
             DIAGNOSTIC_STYLE_PROMPT
         )
 
+    return value
+
+
+def apply_generation_mode(
+    cfg: Dict[str, Any],
+    mode_id: str,
+    *,
+    denoise: float = DEFAULT_IMG2IMG_DENOISE,
+) -> Dict[str, Any]:
+    """Apply one normal-generation mode without mutating caller config."""
+
+    mode_id = str(mode_id or "text2img").strip().lower()
+    if mode_id not in GENERATION_MODES:
+        raise ValueError(
+            f"Unknown generation mode: {mode_id}"
+        )
+
+    value = copy.deepcopy(cfg)
+    definition = GENERATION_MODES[mode_id]
+    value["generation_mode"] = {
+        "id": mode_id,
+        "label": definition["label"],
+        "description": definition["description"],
+    }
+
+    if mode_id == "text2img":
+        value["img2img"] = {
+            "enabled": False,
+        }
+        return value
+
+    denoise = float(denoise)
+    if (
+        not math.isfinite(denoise)
+        or denoise < MIN_UI_IMG2IMG_DENOISE
+        or denoise > MAX_UI_IMG2IMG_DENOISE
+    ):
+        raise ValueError(
+            "Normal Img2img denoise must be between "
+            f"{MIN_UI_IMG2IMG_DENOISE:.2f} and "
+            f"{MAX_UI_IMG2IMG_DENOISE:.2f}."
+        )
+
+    # Productized form of diagnostic G, which won the controlled rating.
+    value = apply_generation_preset(
+        value,
+        "semi_realistic",
+    )
+    value["generation_mode"] = {
+        "id": mode_id,
+        "label": definition["label"],
+        "description": definition["description"],
+    }
+    value["img2img"] = {
+        "enabled": True,
+        "denoise": denoise,
+    }
     return value
 
 
@@ -1737,6 +1811,14 @@ def build_workflow_for_generation(
             generation_preset
         )
 
+    generation_mode = cfg.get(
+        "generation_mode"
+    )
+    if isinstance(generation_mode, dict):
+        sampling["generation_mode"] = copy.deepcopy(
+            generation_mode
+        )
+
     metadata = {
         "width": (
             int(
@@ -1779,6 +1861,11 @@ def build_workflow_for_generation(
         "generation_preset": (
             copy.deepcopy(generation_preset)
             if isinstance(generation_preset, dict)
+            else None
+        ),
+        "generation_mode": (
+            copy.deepcopy(generation_mode)
+            if isinstance(generation_mode, dict)
             else None
         ),
         "removed_template_loras": (
@@ -2539,6 +2626,13 @@ def diagnostic_variant_configs(
     ) -> Dict[str, Any]:
         value = copy.deepcopy(cfg)
         value["sampling_mode"] = "dual"
+        value["img2img"] = {
+            "enabled": False,
+        }
+        value["generation_mode"] = {
+            "id": "text2img",
+            **copy.deepcopy(GENERATION_MODES["text2img"]),
+        }
         value.pop("sampling_overrides", None)
         value.pop("positive_prompt_append", None)
         value["diagnostic"] = {
@@ -2669,6 +2763,10 @@ def img2img_diagnostic_variant_configs(
     variant_f["img2img"] = {
         "enabled": False,
     }
+    variant_f["generation_mode"] = {
+        "id": "text2img",
+        **copy.deepcopy(GENERATION_MODES["text2img"]),
+    }
     variant_f["diagnostic"] = {
         "suite": "img2img_fgh_v1",
         "variant": "F",
@@ -2680,6 +2778,10 @@ def img2img_diagnostic_variant_configs(
         "enabled": True,
         "denoise": 0.60,
     }
+    variant_g["generation_mode"] = {
+        "id": "img2img",
+        **copy.deepcopy(GENERATION_MODES["img2img"]),
+    }
     variant_g["diagnostic"] = {
         "suite": "img2img_fgh_v1",
         "variant": "G",
@@ -2690,6 +2792,10 @@ def img2img_diagnostic_variant_configs(
     variant_h["img2img"] = {
         "enabled": True,
         "denoise": 0.75,
+    }
+    variant_h["generation_mode"] = {
+        "id": "img2img",
+        **copy.deepcopy(GENERATION_MODES["img2img"]),
     }
     variant_h["diagnostic"] = {
         "suite": "img2img_fgh_v1",

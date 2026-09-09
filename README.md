@@ -304,8 +304,20 @@ visual_features_raw             = 两者合并后的过滤输入
 半写实增强 = 平衡重建 + 加权半写实绘画式风格词
 ```
 
-预设名称和实际采样设置都会写入 `sampling_json`。从候选图执行 AI 更正并重新
-生成时，会继承该候选的 LoRA、采样方式、分辨率和 preset provenance。
+普通生成还提供两种模式：
+
+```text
+Img2img（默认推荐） = 原图第一帧 latent + denoise 0.60
+Text2img            = 仅使用 Prompt，继续使用所选生成预设
+```
+
+Img2img 的网页可调范围是 `0.50–0.70`、步长 `0.01`。选择 Img2img 后会自动
+应用评分最佳的 G 配方：关闭 LoRA、单 sampler、35 steps、CFG 6、半写实增强和
+原图纵横比；选择 Text2img 后恢复生成预设选择。
+
+模式、去噪值、预设名称和实际采样设置都会写入 `sampling_json`。从候选图执行
+AI 更正并重新生成时，会继承该候选的 Img2img、LoRA、采样方式、分辨率和 preset
+provenance。
 
 每张候选图可分别保存总体、内容还原、风格还原、构图还原四项评分；旧记录的
 新增评分列保持为空，不需要重建数据库。
@@ -370,12 +382,11 @@ first-frame 标记、上传尺寸和完整动态 workflow 都保存在原有 pro
 
 推荐开发顺序：
 
-1. 用当前露莎米奈样例对 F/G/H 分别评分
-2. 比较 denoise 0.60 与 0.75 对角色身份、画风和构图的影响
-3. 如果 G/H 明显优于 F，将 img2img 做成普通生成的可选预设
-4. 如果身份在低 denoise 下不稳定，再评估 IP-Adapter / ControlNet
-5. 增加“最佳候选”标记与预设评分统计
-6. 后续统计 Prompt correction / LoRA / seed 与评分之间的关系
+1. 用更多来源图片验证 Img2img 默认 denoise 0.60 的泛化效果
+2. 增加“最佳候选”标记与模式/预设评分统计
+3. 检测低 denoise 对原图水印和原人物外观的过度保留
+4. 如果人物身份仍不稳定，再评估 IP-Adapter / ControlNet
+5. 后续统计 Prompt correction / LoRA / seed 与评分之间的关系
 
 当前远程访问维持同一局域网模式，不直接向公网暴露 Studio 端口。
 

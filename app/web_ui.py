@@ -184,6 +184,10 @@ def load_ui_state(
         "correction_model": (
             DEFAULT_CORRECTION_MODEL
         ),
+        "generation_mode": "img2img",
+        "img2img_denoise": (
+            generator.DEFAULT_IMG2IMG_DENOISE
+        ),
     }
 
     if not UI_STATE_PATH.exists():
@@ -1732,6 +1736,21 @@ def config_for_form(
                 "current",
             ),
         )
+        cfg = generator.apply_generation_mode(
+            cfg,
+            first_value(
+                form,
+                "generation_mode",
+                "text2img",
+            ),
+            denoise=float(
+                first_value(
+                    form,
+                    "img2img_denoise",
+                    str(generator.DEFAULT_IMG2IMG_DENOISE),
+                )
+            ),
+        )
 
     return cfg
 
@@ -1881,6 +1900,38 @@ def config_from_generation(
         cfg["generation_preset"] = copy.deepcopy(
             preset
         )
+
+    img2img = sampling.get("img2img")
+    if isinstance(img2img, dict):
+        enabled = bool(img2img.get("enabled"))
+        cfg["img2img"] = {
+            "enabled": enabled,
+        }
+        if enabled:
+            cfg["img2img"]["denoise"] = float(
+                img2img.get(
+                    "denoise",
+                    generator.DEFAULT_IMG2IMG_DENOISE,
+                )
+            )
+
+    generation_mode = sampling.get("generation_mode")
+    if isinstance(generation_mode, dict):
+        cfg["generation_mode"] = copy.deepcopy(
+            generation_mode
+        )
+    elif isinstance(img2img, dict):
+        inferred_mode = (
+            "img2img"
+            if bool(img2img.get("enabled"))
+            else "text2img"
+        )
+        cfg["generation_mode"] = {
+            "id": inferred_mode,
+            **copy.deepcopy(
+                generator.GENERATION_MODES[inferred_mode]
+            ),
+        }
 
     return cfg
 
@@ -2110,6 +2161,7 @@ CSS = r"""
 
 html {
   scroll-behavior: smooth;
+  overflow-x: hidden;
 }
 
 body {
@@ -2212,6 +2264,10 @@ main {
   display: flex;
   flex-direction: column;
   gap: 5px;
+}
+
+[hidden] {
+  display: none !important;
 }
 
 .field.grow {
@@ -2335,6 +2391,10 @@ details > summary {
     minmax(560px, 1.35fr);
   gap: 16px;
   align-items: start;
+}
+
+.workspace > * {
+  min-width: 0;
 }
 
 .original-column {
@@ -2675,13 +2735,19 @@ details > summary {
     right: 10px;
     bottom: 10px;
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
 
   .sticky-generate button {
     width: auto;
+    min-width: 0;
     min-height: 50px;
     font-size: 16px;
+    white-space: normal;
+  }
+
+  .sticky-generate button:last-child {
+    grid-column: 1 / -1;
   }
 
   .candidate-image img {
@@ -2883,6 +2949,40 @@ def generation_preset_summary(
         if label
         else f"Preset: {preset_id}"
     )
+
+
+def generation_mode_summary(
+    raw_json: Any,
+) -> str:
+    try:
+        sampling = json.loads(
+            raw_json
+            or "{}"
+        )
+    except Exception:
+        return ""
+
+    if not isinstance(sampling, dict):
+        return ""
+
+    img2img = sampling.get("img2img")
+    if isinstance(img2img, dict) and bool(img2img.get("enabled")):
+        try:
+            denoise = float(img2img.get("denoise"))
+        except (TypeError, ValueError):
+            return "Mode: Img2img"
+        return f"Mode: Img2img · denoise {denoise:.2f}"
+
+    generation_mode = sampling.get("generation_mode")
+    if not isinstance(generation_mode, dict):
+        return ""
+
+    label = str(
+        generation_mode.get("label", "")
+        or generation_mode.get("id", "")
+        or ""
+    ).strip()
+    return f"Mode: {label}" if label else ""
 
 
 def rating_scale_html(
@@ -3802,6 +3902,17 @@ def page_html(
             if preset_text
             else ""
         )
+        mode_text = generation_mode_summary(
+            row["sampling_json"]
+        )
+        mode_badge = (
+            "<div class='small status-good' "
+            "style='margin-top:5px'>"
+            f"{esc(mode_text)}"
+            "</div>"
+            if mode_text
+            else ""
+        )
 
         candidate_cards.append(
             f"""
@@ -3822,6 +3933,7 @@ def page_html(
                 · {esc(lora_summary(row['loras_json']))}
                 · {esc(row['elapsed_seconds'])} sec
                 {diagnostic_badge}
+                {mode_badge}
                 {preset_badge}
                 {correction_badge}
                 {character_badge}
@@ -3984,12 +4096,48 @@ def page_html(
     ):
         generation_preset_default = "current"
 
+    generation_mode_default = str(
+        state.get(
+            "generation_mode",
+            "img2img",
+        )
+        or "img2img"
+    ).strip().lower()
+    if generation_mode_default not in generator.GENERATION_MODES:
+        generation_mode_default = "img2img"
+
+    try:
+        img2img_denoise_default = float(
+            state.get(
+                "img2img_denoise",
+                generator.DEFAULT_IMG2IMG_DENOISE,
+            )
+        )
+    except (TypeError, ValueError):
+        img2img_denoise_default = generator.DEFAULT_IMG2IMG_DENOISE
+    img2img_denoise_default = min(
+        generator.MAX_UI_IMG2IMG_DENOISE,
+        max(
+            generator.MIN_UI_IMG2IMG_DENOISE,
+            img2img_denoise_default,
+        ),
+    )
+
     generation_preset_options = "".join(
         f"<option value='{esc(preset_id)}' "
         f"{'selected' if preset_id == generation_preset_default else ''}>"
         f"{esc(definition['label'])}</option>"
         for preset_id, definition in (
             generator.GENERATION_PRESETS.items()
+        )
+    )
+
+    generation_mode_options = "".join(
+        f"<option value='{esc(mode_id)}' "
+        f"{'selected' if mode_id == generation_mode_default else ''}>"
+        f"{esc(definition['label'])}</option>"
+        for mode_id, definition in (
+            generator.GENERATION_MODES.items()
         )
     )
 
@@ -4253,10 +4401,40 @@ def page_html(
 
             <div class="toolbar">
               <div class="field grow">
+                <label>生成模式</label>
+                <select
+                  id="generation-mode"
+                  name="generation_mode"
+                  onchange="refreshGenerationModeUi()"
+                >
+                  {generation_mode_options}
+                </select>
+              </div>
+
+              <div class="field grow">
                 <label>生成预设</label>
-                <select name="generation_preset">
+                <select id="generation-preset" name="generation_preset">
                   {generation_preset_options}
                 </select>
+              </div>
+
+              <div class="field grow" id="img2img-settings">
+                <label>
+                  Img2img Denoise：
+                  <output id="img2img-denoise-value">
+                    {img2img_denoise_default:.2f}
+                  </output>
+                </label>
+                <input
+                  id="img2img-denoise"
+                  type="range"
+                  name="img2img_denoise"
+                  min="{generator.MIN_UI_IMG2IMG_DENOISE:.2f}"
+                  max="{generator.MAX_UI_IMG2IMG_DENOISE:.2f}"
+                  step="0.01"
+                  value="{img2img_denoise_default:.2f}"
+                  oninput="refreshImg2imgDenoise()"
+                >
               </div>
 
               <div class="field">
@@ -4296,6 +4474,13 @@ def page_html(
                   placeholder="同一次诊断的所有图片共用 seed"
                 >
               </div>
+            </div>
+
+            <div class="small" style="margin-top:10px">
+              Img2img（推荐）会自动使用本次评分最佳的 G 配方：原图第一帧、
+              denoise 0.60、关闭 LoRA、单 sampler、35 steps、CFG 6、
+              半写实增强和原图纵横比。选择 Img2img 时“生成预设”会被锁定；
+              切回 Text2img 后恢复正常选择。
             </div>
 
             <div class="small" style="margin-top:10px">
@@ -4922,6 +5107,42 @@ function loadGenerationPrompt(prompt) {{
 
 let jobProgressTimer = null;
 
+function refreshImg2imgDenoise() {{
+  const slider = document.getElementById('img2img-denoise');
+  const output = document.getElementById('img2img-denoise-value');
+  if (!slider || !output) return;
+
+  const value = Number(slider.value);
+  output.textContent = Number.isFinite(value)
+    ? value.toFixed(2)
+    : '0.60';
+}}
+
+function refreshGenerationModeUi() {{
+  const mode = document.getElementById('generation-mode');
+  const preset = document.getElementById('generation-preset');
+  const settings = document.getElementById('img2img-settings');
+  if (!mode) return;
+
+  const usesReference = mode.value === 'img2img';
+  if (preset) {{
+    if (usesReference) {{
+      if (!preset.disabled) {{
+        preset.dataset.text2imgPreset = preset.value;
+      }}
+      preset.value = 'semi_realistic';
+      preset.disabled = true;
+    }} else {{
+      preset.disabled = false;
+      if (preset.dataset.text2imgPreset) {{
+        preset.value = preset.dataset.text2imgPreset;
+      }}
+    }}
+  }}
+  if (settings) settings.hidden = !usesReference;
+  refreshImg2imgDenoise();
+}}
+
 function operationProgressText(action, fallbackText) {{
   const path = new URL(action, window.location.href).pathname;
 
@@ -5056,6 +5277,7 @@ async function submitWithProgress(event, form, fallbackText) {{
 }}
 
 refreshPromptPreview();
+refreshGenerationModeUi();
 </script>
 
 </body>
@@ -6366,6 +6588,30 @@ class Handler(
                                 "id",
                                 "current",
                             )
+                        ),
+                        "generation_mode": str(
+                            cfg.get(
+                                "generation_mode",
+                                {},
+                            ).get(
+                                "id",
+                                "text2img",
+                            )
+                        ),
+                        "img2img_denoise": min(
+                            generator.MAX_UI_IMG2IMG_DENOISE,
+                            max(
+                                generator.MIN_UI_IMG2IMG_DENOISE,
+                                float(
+                                    first_value(
+                                        form,
+                                        "img2img_denoise",
+                                        str(
+                                            generator.DEFAULT_IMG2IMG_DENOISE
+                                        ),
+                                    )
+                                ),
+                            ),
                         ),
                         "last_run_id": run_id,
                         "correction_model": (

@@ -42,6 +42,12 @@ class GenerationDiagnosticTests(unittest.TestCase):
         self.assertFalse(variants["C"]["lora_slots"][0]["enabled"])
         self.assertFalse(variants["D"]["lora_slots"][0]["enabled"])
         self.assertFalse(variants["E"]["lora_slots"][0]["enabled"])
+        for variant in variants.values():
+            self.assertFalse(variant["img2img"]["enabled"])
+            self.assertEqual(
+                variant["generation_mode"]["id"],
+                "text2img",
+            )
         self.assertEqual(
             variants["D"]["positive_prompt_append"],
             generator.DIAGNOSTIC_STYLE_PROMPT,
@@ -163,6 +169,9 @@ class GenerationDiagnosticTests(unittest.TestCase):
         self.assertFalse(variants["F"]["img2img"]["enabled"])
         self.assertEqual(variants["G"]["img2img"]["denoise"], 0.60)
         self.assertEqual(variants["H"]["img2img"]["denoise"], 0.75)
+        self.assertEqual(variants["F"]["generation_mode"]["id"], "text2img")
+        self.assertEqual(variants["G"]["generation_mode"]["id"], "img2img")
+        self.assertEqual(variants["H"]["generation_mode"]["id"], "img2img")
 
     def test_img2img_workflow_uses_source_latent_and_records_denoise(self):
         variants = dict(
@@ -214,6 +223,10 @@ class GenerationDiagnosticTests(unittest.TestCase):
         )
         self.assertTrue(metadata["sampling"]["img2img"]["enabled"])
         self.assertEqual(metadata["sampling"]["img2img"]["denoise"], 0.60)
+        self.assertEqual(
+            metadata["sampling"]["generation_mode"]["id"],
+            "img2img",
+        )
 
     def test_img2img_upload_uses_first_frame_and_exact_target_size(self):
         with tempfile.TemporaryDirectory() as directory:
