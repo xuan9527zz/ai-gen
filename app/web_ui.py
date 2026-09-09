@@ -4286,14 +4286,14 @@ def page_html(
               </div>
 
               <div class="field grow">
-                <label>A–E 固定 Seed（留空则随机）</label>
+                <label>诊断固定 Seed（留空则随机）</label>
                 <input
                   type="number"
                   name="diagnostic_seed"
                   min="0"
                   max="9223372036854775807"
                   value="{esc(diagnostic_seed_default)}"
-                  placeholder="同一 seed 生成 A / B / C / D / E"
+                  placeholder="同一次诊断的所有图片共用 seed"
                 >
               </div>
             </div>
@@ -4311,6 +4311,14 @@ def page_html(
               D 在 C 上追加半写实绘画式风格词；E 在 D 上改用原图纵横比。
               A–C 共用原 Prompt 和分辨率；D 只改变风格词；E 只再改变分辨率。
               五张共用 seed 和 checkpoint。
+            </div>
+
+            <div class="small" style="margin-top:10px">
+              Img2img 诊断会各生成 1 张：F 是半写实增强的纯文生图基线；
+              G 使用原图第一帧、去噪 0.60；H 使用同一原图、去噪 0.75。
+              三张关闭 LoRA，并共用 Prompt、seed、checkpoint、单 sampler、
+              CFG 6 和原图纵横比分辨率，用来判断参考图 conditioning
+              能否改善画风与构图。
             </div>
 
             <hr
@@ -4351,6 +4359,15 @@ def page_html(
               {'disabled' if selected is None else ''}
             >
               A–E 质量诊断
+            </button>
+
+            <button
+              type="submit"
+              class="secondary"
+              formaction="/diagnose-img2img"
+              {'disabled' if selected is None else ''}
+            >
+              F–H Img2img 诊断
             </button>
 
             <button
@@ -4913,6 +4930,9 @@ function operationProgressText(action, fallbackText) {{
   }}
   if (path === '/diagnose-generation') {{
     return '正在生成 A–E 诊断图：ComfyUI 将依次完成 5 张…';
+  }}
+  if (path === '/diagnose-img2img') {{
+    return '正在生成 F–H 诊断图：纯文生图、去噪 0.60、去噪 0.75 共 3 张…';
   }}
   if (path === '/correct-and-generate') {{
     return '正在修改 Prompt，并生成新的候选图…';
@@ -5863,10 +5883,13 @@ class Handler(
             return
 
         # ----------------------------------------------------
-        # Controlled A-E generation-quality diagnostic
+        # Controlled generation-quality diagnostics
         # ----------------------------------------------------
 
-        if parsed.path == "/diagnose-generation":
+        if parsed.path in {
+            "/diagnose-generation",
+            "/diagnose-img2img",
+        }:
             run_id = int(
                 first_value(
                     form,
@@ -5966,7 +5989,13 @@ class Handler(
                         final_prompt=final_prompt,
                     )
 
-                    results = generator.generate_diagnostic_abcde(
+                    is_img2img = parsed.path == "/diagnose-img2img"
+                    diagnostic_runner = (
+                        generator.generate_diagnostic_fgh
+                        if is_img2img
+                        else generator.generate_diagnostic_abcde
+                    )
+                    results = diagnostic_runner(
                         run_id=run_id,
                         cfg=cfg,
                         prompt_override=final_prompt,
@@ -6055,8 +6084,15 @@ class Handler(
                     {
                         "run_id": run_id,
                         "message": (
-                            "A–E diagnostic completed: "
-                            f"{len(results)}/5 · seed {fixed_seed}"
+                            (
+                                "F–H img2img diagnostic completed: "
+                                f"{len(results)}/3 · seed {fixed_seed}"
+                            )
+                            if is_img2img
+                            else (
+                                "A–E diagnostic completed: "
+                                f"{len(results)}/5 · seed {fixed_seed}"
+                            )
                         ),
                     },
                 )

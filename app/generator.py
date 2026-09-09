@@ -55,6 +55,7 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
+import io
 import json
 import math
 import mimetypes
@@ -68,14 +69,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "generation.json"
 
-GENERATOR_VERSION = "1.3"
+GENERATOR_VERSION = "1.4"
 
 DIAGNOSTIC_STYLE_PROMPT = (
     "(semi-realistic illustration:1.2), "
@@ -1082,6 +1083,86 @@ def resolve_resolution_config(
     return resolved
 
 
+def upload_img2img_source(
+    comfy_url: str,
+    source_path: Path,
+    *,
+    width: int,
+    height: int,
+) -> Dict[str, Any]:
+    """Upload one static, exactly-sized source frame for img2img."""
+
+    source_path = Path(source_path)
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"Img2img source image not found: {source_path}"
+        )
+    if width < 1 or height < 1:
+        raise ValueError(
+            "Img2img upload width and height must be positive."
+        )
+
+    with Image.open(source_path) as source:
+        source.seek(0)
+        source_width, source_height = source.size
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        if image.size != (width, height):
+            image = image.resize(
+                (width, height),
+                Image.Resampling.LANCZOS,
+            )
+
+        payload = io.BytesIO()
+        image.save(payload, format="PNG")
+
+    payload.seek(0)
+    source_sha256 = sha256_file(source_path)
+    upload_name = (
+        f"illustrious_img2img_{source_sha256[:16]}_"
+        f"{width}x{height}.png"
+    )
+    response = requests.post(
+        f"{str(comfy_url).rstrip('/')}/upload/image",
+        files={
+            "image": (
+                upload_name,
+                payload,
+                "image/png",
+            )
+        },
+        data={
+            "type": "input",
+            "overwrite": "true",
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    result = response.json()
+    uploaded_name = str(result.get("name", "")).strip()
+    if not uploaded_name:
+        raise RuntimeError(
+            f"ComfyUI img2img upload returned invalid data: {result}"
+        )
+
+    subfolder = str(result.get("subfolder", "")).strip(" /\\")
+    comfy_image = (
+        f"{subfolder}/{uploaded_name}"
+        if subfolder
+        else uploaded_name
+    )
+    return {
+        "comfy_image": comfy_image,
+        "source_path": str(source_path),
+        "source_sha256": source_sha256,
+        "source_width": int(source_width),
+        "source_height": int(source_height),
+        "upload_width": int(width),
+        "upload_height": int(height),
+        "frame": 0,
+        "resize_method": "lanczos_exact",
+    }
+
+
 def build_workflow_for_generation(
     template: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -1468,6 +1549,102 @@ def build_workflow_for_generation(
             "resolution.mode must be workflow, fixed, or source."
         )
 
+    img2img_metadata: Dict[str, Any] = {
+        "enabled": False,
+    }
+    img2img = cfg.get("img2img")
+    if isinstance(img2img, dict) and bool(img2img.get("enabled")):
+        if sampling_mode != "single":
+            raise ValueError(
+                "Img2img currently requires sampling_mode='single'."
+            )
+
+        denoise = float(img2img.get("denoise", 0.0))
+        if denoise <= 0.0 or denoise > 1.0:
+            raise ValueError(
+                "Img2img denoise must be greater than 0 and at most 1."
+            )
+
+        comfy_image = str(
+            img2img.get("comfy_image", "")
+        ).strip()
+        if not comfy_image:
+            raise ValueError(
+                "Img2img requires a ComfyUI input image name."
+            )
+
+        steps = int(base_sampler["inputs"].get("steps", 0))
+        if steps < 1:
+            raise ValueError(
+                "Img2img base sampler steps must be positive."
+            )
+        start_at_step = max(
+            0,
+            min(
+                steps - 1,
+                int(round(steps * (1.0 - denoise))),
+            ),
+        )
+        base_sampler["inputs"].update({
+            "start_at_step": start_at_step,
+            "end_at_step": steps,
+            "add_noise": "enable",
+            "return_with_leftover_noise": "disable",
+        })
+
+        load_image_id = "9101"
+        vae_encode_id = "9102"
+        if load_image_id in workflow or vae_encode_id in workflow:
+            raise ValueError(
+                "Workflow already uses reserved img2img node IDs 9101/9102."
+            )
+        workflow[load_image_id] = {
+            "inputs": {
+                "image": comfy_image,
+            },
+            "class_type": "LoadImage",
+            "_meta": {
+                "title": "IMG2IMG Source (first frame)",
+            },
+        }
+        workflow[vae_encode_id] = {
+            "inputs": {
+                "pixels": [load_image_id, 0],
+                "vae": [ids["base_checkpoint"], 2],
+            },
+            "class_type": "VAEEncode",
+            "_meta": {
+                "title": "IMG2IMG VAE Encode",
+            },
+        }
+        base_sampler["inputs"]["latent_image"] = [
+            vae_encode_id,
+            0,
+        ]
+
+        img2img_metadata = {
+            "enabled": True,
+            "denoise": denoise,
+            "start_at_step": start_at_step,
+            "source_node_id": load_image_id,
+            "vae_encode_node_id": vae_encode_id,
+            **{
+                key: copy.deepcopy(img2img[key])
+                for key in (
+                    "comfy_image",
+                    "source_path",
+                    "source_sha256",
+                    "source_width",
+                    "source_height",
+                    "upload_width",
+                    "upload_height",
+                    "frame",
+                    "resize_method",
+                )
+                if key in img2img
+            },
+        }
+
     width = latent[
         "inputs"
     ].get(
@@ -1482,6 +1659,7 @@ def build_workflow_for_generation(
 
     sampling = {
         "mode": sampling_mode,
+        "img2img": img2img_metadata,
         "resolution": {
             "mode": resolution_mode,
             "width": (
@@ -1957,16 +2135,18 @@ def generate_candidates(
             workflow_path
         )
 
+        source_path = Path(
+            str(
+                analysis[
+                    "first_seen_path"
+                ]
+            )
+        )
+
         cfg = resolve_resolution_config(
             cfg,
             template,
-            source_path=Path(
-                str(
-                    analysis[
-                        "first_seen_path"
-                    ]
-                )
-            ),
+            source_path=source_path,
         )
 
         prompt = append_generation_prompt(
@@ -1986,6 +2166,31 @@ def generate_candidates(
         check_comfy(
             comfy_url
         )
+
+        img2img = cfg.get("img2img")
+        if isinstance(img2img, dict) and bool(img2img.get("enabled")):
+            resolution = cfg.get("resolution", {})
+            width = int(resolution.get("width", 0))
+            height = int(resolution.get("height", 0))
+            if width < 1 or height < 1:
+                latent = validate_node(
+                    template,
+                    ids["latent"],
+                    "EmptyLatentImage",
+                )
+                width = int(latent["inputs"].get("width", 0))
+                height = int(latent["inputs"].get("height", 0))
+
+            upload_metadata = upload_img2img_source(
+                comfy_url,
+                source_path,
+                width=width,
+                height=height,
+            )
+            cfg["img2img"] = {
+                **copy.deepcopy(img2img),
+                **upload_metadata,
+            }
 
         if seeds_override is None:
             seeds = make_seeds(
@@ -2439,6 +2644,94 @@ def generate_diagnostic_abcde(
         print()
         print(
             f"[Diagnostic {variant}] seed={fixed_seed}"
+        )
+        generated = generate_candidates(
+            run_id=run_id,
+            count=1,
+            cfg=variant_cfg,
+            prompt_override=prompt_override,
+            seeds_override=[fixed_seed],
+        )
+        results.extend(generated)
+
+    return results
+
+
+def img2img_diagnostic_variant_configs(
+    cfg: Dict[str, Any],
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Build controlled F/G/H text2img-vs-img2img configs."""
+
+    variant_f = apply_generation_preset(
+        cfg,
+        "semi_realistic",
+    )
+    variant_f["img2img"] = {
+        "enabled": False,
+    }
+    variant_f["diagnostic"] = {
+        "suite": "img2img_fgh_v1",
+        "variant": "F",
+        "label": "text2img baseline + semi-realistic style",
+    }
+
+    variant_g = copy.deepcopy(variant_f)
+    variant_g["img2img"] = {
+        "enabled": True,
+        "denoise": 0.60,
+    }
+    variant_g["diagnostic"] = {
+        "suite": "img2img_fgh_v1",
+        "variant": "G",
+        "label": "img2img denoise 0.60",
+    }
+
+    variant_h = copy.deepcopy(variant_f)
+    variant_h["img2img"] = {
+        "enabled": True,
+        "denoise": 0.75,
+    }
+    variant_h["diagnostic"] = {
+        "suite": "img2img_fgh_v1",
+        "variant": "H",
+        "label": "img2img denoise 0.75",
+    }
+
+    return [
+        ("F", variant_f),
+        ("G", variant_g),
+        ("H", variant_h),
+    ]
+
+
+def generate_diagnostic_fgh(
+    *,
+    run_id: int,
+    cfg: Dict[str, Any],
+    prompt_override: Optional[str] = None,
+    seed: Optional[int] = None,
+    variants: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Generate F/G/H with one prompt, seed, checkpoint and resolution."""
+
+    fixed_seed = (
+        make_seeds(1)[0]
+        if seed is None
+        else int(seed)
+    )
+    selected = (
+        {value.upper() for value in variants}
+        if variants is not None
+        else None
+    )
+    results: List[Dict[str, Any]] = []
+
+    for variant, variant_cfg in img2img_diagnostic_variant_configs(cfg):
+        if selected is not None and variant not in selected:
+            continue
+        print()
+        print(
+            f"[Img2img diagnostic {variant}] seed={fixed_seed}"
         )
         generated = generate_candidates(
             run_id=run_id,

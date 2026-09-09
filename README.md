@@ -20,7 +20,7 @@
 - BASE / REFINER 两段式 workflow
 - 3 个可开关 LoRA 槽位
 - 1 / 5 / 10 个不同 seed 候选图
-- 固定 Prompt / seed 的 A–E 生成质量诊断
+- 固定 Prompt / seed 的 A–E 文生图与 F–H img2img 质量诊断
 - 当前设置 / 平衡重建 / 半写实增强三种生成预设
 - 自然语言 Prompt 更正
 - 中文/别名/轻微误差人物输入 → Danbooru character tag → NAID 精确验证
@@ -294,7 +294,7 @@ visual_features_raw             = 两者合并后的过滤输入
 
 确定性恢复只接受 VLM 明确出现的短语，并排除 `no bokeh` 等否定语境。
 
-## 9. 生成预设与 A–E 质量诊断
+## 9. 生成预设与 A–H 质量诊断
 
 手机和电脑使用同一套响应式 Web UI。普通生成提供三种预设：
 
@@ -310,7 +310,7 @@ visual_features_raw             = 两者合并后的过滤输入
 每张候选图可分别保存总体、内容还原、风格还原、构图还原四项评分；旧记录的
 新增评分列保持为空，不需要重建数据库。
 
-识图、生图、A–E 诊断和候选更正通过网页后台请求提交。当前页面不会再跳入空白
+识图、生图、A–H 诊断和候选更正通过网页后台请求提交。当前页面不会再跳入空白
 等待状态，而会显示阶段动画和真实等待秒数；任务完成后自动载入结果。进度条为
 不确定进度动画，不伪造 ComfyUI 尚未提供的采样百分比。
 
@@ -351,18 +351,31 @@ E = D + 按原图纵横比自动拟合分辨率
 分辨率，D 只追加固定的风格提示词，E 只在 D 的基础上按原图纵横比调整分辨率。
 每条结果的
 `sampling_json` 和完整 workflow snapshot 都会写入现有 `generation_runs`，不新增或
-简化 provenance 表。候选卡片会显示 Diagnostic A–E 标识。
+简化 provenance 表。候选卡片会显示对应的 Diagnostic A–H 标识。
+
+点击 `F–H Img2img 诊断` 会再生成三张严格对照图：
+
+```text
+F = E 的纯 text2img 基线
+G = F 的全部设置 + 原图 first-frame latent + denoise 0.60
+H = F 的全部设置 + 原图 first-frame latent + denoise 0.75
+```
+
+F–H 共用 Prompt、seed、checkpoint、分辨率、单 sampler、CFG 6，并关闭 LoRA。
+上传给 ComfyUI 的参考图会先固定取第一帧，再用 Lanczos 调整到目标分辨率，避免
+GIF / APNG / animated WebP 形成多帧 batch。去噪值、起始采样步、参考图 SHA-256、
+first-frame 标记、上传尺寸和完整动态 workflow 都保存在原有 provenance 中。
 
 ## 10. 当前下一步
 
 推荐开发顺序：
 
-1. 用当前 10–20 张图片重复 A–E 回归测试
-2. 比较 Analyzer 动态风格词与 D/E 固定加权风格 preset 的评分
-3. 根据四项评分选出默认生成 preset
-4. 增加“最佳候选”标记与预设评分统计
-5. 统计 Prompt correction / LoRA / seed 与评分之间的关系
-6. 后续再考虑参考图 conditioning、RAG / preference learning
+1. 用当前露莎米奈样例对 F/G/H 分别评分
+2. 比较 denoise 0.60 与 0.75 对角色身份、画风和构图的影响
+3. 如果 G/H 明显优于 F，将 img2img 做成普通生成的可选预设
+4. 如果身份在低 denoise 下不稳定，再评估 IP-Adapter / ControlNet
+5. 增加“最佳候选”标记与预设评分统计
+6. 后续统计 Prompt correction / LoRA / seed 与评分之间的关系
 
 当前远程访问维持同一局域网模式，不直接向公网暴露 Studio 端口。
 
