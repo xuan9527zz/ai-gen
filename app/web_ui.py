@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.2.0
+Illustrious Reconstruction Studio v2.2.1
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
@@ -9,6 +9,7 @@ Local/LAN browser workspace for:
 4) ComfyUI generation with 3 LoRA slots
 5) original-vs-generated comparison + multidimensional 1-5 ratings
 6) mobile-friendly UI
+7) non-navigating long-task progress overlay with real elapsed time
 
 Expected sibling files:
     illustrious_web_ui.py
@@ -2395,6 +2396,64 @@ details > summary {
 .status-bad { color: var(--bad); }
 .status-warn { color: var(--warn); }
 
+.job-progress-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(4, 6, 10, .78);
+  backdrop-filter: blur(5px);
+}
+
+.job-progress-overlay[hidden] {
+  display: none;
+}
+
+.job-progress-card {
+  width: min(520px, 100%);
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  background: var(--panel);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .55);
+}
+
+.job-progress-track {
+  height: 12px;
+  margin: 14px 0 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #0a0d12;
+  border: 1px solid var(--border);
+}
+
+.job-progress-bar {
+  width: 34%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent2), var(--accent));
+  animation: job-progress-slide 1.25s ease-in-out infinite alternate;
+}
+
+.job-progress-bar.complete {
+  width: 100%;
+  animation: none;
+}
+
+.job-progress-bar.failed {
+  width: 100%;
+  animation: none;
+  background: var(--bad);
+}
+
+@keyframes job-progress-slide {
+  from { transform: translateX(-18%); }
+  to { transform: translateX(210%); }
+}
+
 .tabline {
   display: flex;
   gap: 8px;
@@ -3463,7 +3522,8 @@ def page_html(
                 method="post"
                 action="/reanalyze"
                 onsubmit="
-                  return markBusy(
+                  return submitWithProgress(
+                    event,
                     this,
                     '重新分析中… VLM + WD14 可能需要几分钟'
                   )
@@ -3679,7 +3739,8 @@ def page_html(
                   method="post"
                   action="/correct-and-generate"
                   onsubmit="
-                    return markBusy(
+                    return submitWithProgress(
+                      event,
                       this,
                       'AI 正在修改 Prompt 并重新生成…'
                     )
@@ -3806,7 +3867,8 @@ def page_html(
           method="post"
           action="/generate"
           onsubmit="
-            return markBusy(
+            return submitWithProgress(
+              event,
               this,
               '生成中… 请等待 ComfyUI 完成'
             )
@@ -4106,7 +4168,8 @@ def page_html(
         action="/upload-analyze"
         enctype="multipart/form-data"
         onsubmit="
-          return markBusy(
+          return submitWithProgress(
+            event,
             this,
             '上传并分析中… 每张图片可能需要几分钟'
           )
@@ -4200,6 +4263,36 @@ def page_html(
     </div>
   </div>
 </main>
+
+<div
+  id="job-progress-overlay"
+  class="job-progress-overlay"
+  role="status"
+  aria-live="polite"
+  hidden
+>
+  <div class="job-progress-card">
+    <h2 id="job-progress-title">任务处理中</h2>
+    <div class="job-progress-track">
+      <div id="job-progress-bar" class="job-progress-bar"></div>
+    </div>
+    <div id="job-progress-stage">任务已提交到本机。</div>
+    <div class="small muted" style="margin-top:8px">
+      已等待 <span id="job-progress-elapsed">0</span> 秒。
+      页面会保留在这里，完成后自动显示结果。
+    </div>
+    <button
+      id="job-progress-close"
+      type="button"
+      class="secondary"
+      style="margin-top:12px"
+      onclick="hideJobProgress()"
+      hidden
+    >
+      返回当前页面
+    </button>
+  </div>
+</div>
 
 <script>
 function splitPrompt(text) {{
@@ -4397,7 +4490,82 @@ function loadGenerationPrompt(prompt) {{
   }});
 }}
 
-function markBusy(form, text) {{
+let jobProgressTimer = null;
+
+function operationProgressText(action, fallbackText) {{
+  const path = new URL(action, window.location.href).pathname;
+
+  if (path === '/upload-analyze' || path === '/reanalyze') {{
+    return '正在识图：VLM 与 WD14 正在分析图片…';
+  }}
+  if (path === '/diagnose-generation') {{
+    return '正在生成 A–E 诊断图：ComfyUI 将依次完成 5 张…';
+  }}
+  if (path === '/correct-and-generate') {{
+    return '正在修改 Prompt，并生成新的候选图…';
+  }}
+  if (path === '/generate') {{
+    return '正在生图：ComfyUI 正在处理候选图…';
+  }}
+
+  return fallbackText || '任务处理中…';
+}}
+
+function showJobProgress(text) {{
+  const overlay = document.getElementById('job-progress-overlay');
+  const title = document.getElementById('job-progress-title');
+  const stage = document.getElementById('job-progress-stage');
+  const elapsed = document.getElementById('job-progress-elapsed');
+  const bar = document.getElementById('job-progress-bar');
+  const close = document.getElementById('job-progress-close');
+  const startedAt = Date.now();
+
+  title.textContent = '任务处理中';
+  stage.textContent = text || '任务已提交到本机。';
+  elapsed.textContent = '0';
+  bar.classList.remove('complete', 'failed');
+  close.hidden = true;
+  overlay.hidden = false;
+
+  if (jobProgressTimer) clearInterval(jobProgressTimer);
+  jobProgressTimer = setInterval(() => {{
+    elapsed.textContent = String(
+      Math.floor((Date.now() - startedAt) / 1000)
+    );
+  }}, 1000);
+}}
+
+function hideJobProgress() {{
+  const overlay = document.getElementById('job-progress-overlay');
+  overlay.hidden = true;
+  if (jobProgressTimer) {{
+    clearInterval(jobProgressTimer);
+    jobProgressTimer = null;
+  }}
+}}
+
+async function submitWithProgress(event, form, fallbackText) {{
+  event.preventDefault();
+
+  const submitter = event.submitter;
+  const action = (
+    submitter && submitter.formAction
+      ? submitter.formAction
+      : form.action
+  );
+  const method = String(form.method || 'POST').toUpperCase();
+  const formData = new FormData(form);
+  let body;
+
+  if (String(form.enctype).toLowerCase().includes('multipart/form-data')) {{
+    body = formData;
+  }} else {{
+    body = new URLSearchParams();
+    for (const [key, value] of formData.entries()) {{
+      if (typeof value === 'string') body.append(key, value);
+    }}
+  }}
+
   const buttons = form.querySelectorAll(
     'button[type="submit"]'
   );
@@ -4405,10 +4573,53 @@ function markBusy(form, text) {{
   for (const button of buttons) {{
     button.disabled = true;
     button.dataset.oldText = button.textContent;
-    button.textContent = text || '处理中…';
+    button.textContent = '处理中…';
   }}
 
-  return true;
+  showJobProgress(
+    operationProgressText(action, fallbackText)
+  );
+
+  try {{
+    const response = await fetch(action, {{
+      method,
+      body,
+      redirect: 'follow'
+    }});
+
+    if (!response.ok) {{
+      throw new Error('服务器返回 ' + response.status);
+    }}
+
+    const title = document.getElementById('job-progress-title');
+    const stage = document.getElementById('job-progress-stage');
+    const bar = document.getElementById('job-progress-bar');
+    title.textContent = '任务完成';
+    stage.textContent = '正在载入最新结果…';
+    bar.classList.add('complete');
+
+    await new Promise(resolve => setTimeout(resolve, 350));
+    window.location.assign(response.url || '/');
+
+  }} catch (error) {{
+    const title = document.getElementById('job-progress-title');
+    const stage = document.getElementById('job-progress-stage');
+    const bar = document.getElementById('job-progress-bar');
+    const close = document.getElementById('job-progress-close');
+    title.textContent = '任务连接失败';
+    stage.textContent = String(error && error.message ? error.message : error);
+    bar.classList.add('failed');
+    close.hidden = false;
+
+    for (const button of buttons) {{
+      button.disabled = false;
+      if (button.dataset.oldText) {{
+        button.textContent = button.dataset.oldText;
+      }}
+    }}
+  }}
+
+  return false;
 }}
 
 refreshPromptPreview();
