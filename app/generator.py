@@ -75,7 +75,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "generation.json"
 
-GENERATOR_VERSION = "1.2"
+GENERATOR_VERSION = "1.3"
 
 DIAGNOSTIC_STYLE_PROMPT = (
     "(semi-realistic illustration:1.2), "
@@ -85,6 +85,21 @@ DIAGNOSTIC_STYLE_PROMPT = (
     "volumetric lighting, soft bloom, "
     "cinematic depth of field"
 )
+
+GENERATION_PRESETS = {
+    "current": {
+        "label": "当前设置",
+        "description": "保留当前 LoRA、workflow 分辨率和双 sampler 设置。",
+    },
+    "balanced": {
+        "label": "平衡重建",
+        "description": "关闭 LoRA，单 sampler，35 steps，CFG 6，使用原图纵横比。",
+    },
+    "semi_realistic": {
+        "label": "半写实增强",
+        "description": "平衡重建设置，并追加加权的半写实绘画式风格提示词。",
+    },
+}
 
 
 # ============================================================
@@ -224,6 +239,61 @@ def load_config(
     return cfg
 
 
+def apply_generation_preset(
+    cfg: Dict[str, Any],
+    preset_id: str,
+) -> Dict[str, Any]:
+    """Apply one UI generation preset without mutating caller config."""
+
+    preset_id = str(
+        preset_id
+        or "current"
+    ).strip().lower()
+    if preset_id not in GENERATION_PRESETS:
+        raise ValueError(
+            f"Unknown generation preset: {preset_id}"
+        )
+
+    value = copy.deepcopy(cfg)
+    definition = GENERATION_PRESETS[preset_id]
+    value["generation_preset"] = {
+        "id": preset_id,
+        "label": definition["label"],
+        "description": definition["description"],
+    }
+
+    if preset_id == "current":
+        return value
+
+    for slot in value.get("lora_slots", []):
+        if isinstance(slot, dict):
+            slot["enabled"] = False
+
+    value["sampling_mode"] = "single"
+    value["sampling_overrides"] = {
+        "base": {
+            "steps": 35,
+            "cfg": 6.0,
+            "start_at_step": 0,
+            "end_at_step": 35,
+            "add_noise": "enable",
+            "return_with_leftover_noise": "disable",
+        }
+    }
+    value["resolution"] = {
+        "mode": "source",
+        "multiple": 64,
+    }
+    value.pop("positive_prompt_append", None)
+
+    if preset_id == "semi_realistic":
+        value["positive_prompt_append"] = (
+            DIAGNOSTIC_STYLE_PROMPT
+        )
+
+    return value
+
+
 def enabled_loras(
     cfg: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -348,6 +418,9 @@ CREATE TABLE IF NOT EXISTS generation_ratings (
     generation_run_id INTEGER NOT NULL UNIQUE,
 
     overall_score INTEGER,
+    semantic_score INTEGER,
+    style_score INTEGER,
+    composition_score INTEGER,
     comment TEXT,
 
     created_at TEXT NOT NULL,
@@ -360,9 +433,49 @@ CREATE TABLE IF NOT EXISTS generation_ratings (
     CHECK(
         overall_score IS NULL
         OR overall_score BETWEEN 1 AND 5
+    ),
+    CHECK(
+        semantic_score IS NULL
+        OR semantic_score BETWEEN 1 AND 5
+    ),
+    CHECK(
+        style_score IS NULL
+        OR style_score BETWEEN 1 AND 5
+    ),
+    CHECK(
+        composition_score IS NULL
+        OR composition_score BETWEEN 1 AND 5
     )
 );
 """
+
+
+GENERATION_RATING_MIGRATIONS = {
+    "semantic_score": "INTEGER",
+    "style_score": "INTEGER",
+    "composition_score": "INTEGER",
+}
+
+
+def migrate_generation_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    """Add backward-compatible columns missing from older local DBs."""
+
+    existing = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(generation_ratings)"
+        ).fetchall()
+    }
+
+    for column, sql_type in GENERATION_RATING_MIGRATIONS.items():
+        if column in existing:
+            continue
+        conn.execute(
+            f"ALTER TABLE generation_ratings "
+            f"ADD COLUMN {column} {sql_type}"
+        )
 
 
 def connect_db(
@@ -388,6 +501,10 @@ def connect_db(
 
     conn.executescript(
         GENERATION_SCHEMA
+    )
+
+    migrate_generation_schema(
+        conn
     )
 
     conn.commit()
@@ -1434,6 +1551,14 @@ def build_workflow_for_generation(
             diagnostic
         )
 
+    generation_preset = cfg.get(
+        "generation_preset"
+    )
+    if isinstance(generation_preset, dict):
+        sampling["preset"] = copy.deepcopy(
+            generation_preset
+        )
+
     metadata = {
         "width": (
             int(
@@ -1471,6 +1596,11 @@ def build_workflow_for_generation(
         "diagnostic": (
             copy.deepcopy(diagnostic)
             if isinstance(diagnostic, dict)
+            else None
+        ),
+        "generation_preset": (
+            copy.deepcopy(generation_preset)
+            if isinstance(generation_preset, dict)
             else None
         ),
         "removed_template_loras": (

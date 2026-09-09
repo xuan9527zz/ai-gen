@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.1.1
+Illustrious Reconstruction Studio v2.2.0
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
 2) AI natural-language prompt corrections
 3) manual positive-prompt additions / direct final-prompt editing
 4) ComfyUI generation with 3 LoRA slots
-5) original-vs-generated comparison + 1-5 ratings
+5) original-vs-generated comparison + multidimensional 1-5 ratings
 6) mobile-friendly UI
 
 Expected sibling files:
@@ -36,6 +36,7 @@ Security:
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import html
 import json
@@ -629,6 +630,10 @@ def connect_db() -> sqlite3.Connection:
         generator.GENERATION_SCHEMA
     )
 
+    generator.migrate_generation_schema(
+        conn
+    )
+
     conn.executescript(
         STUDIO_SCHEMA
     )
@@ -639,6 +644,9 @@ def connect_db() -> sqlite3.Connection:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             generation_run_id INTEGER NOT NULL UNIQUE,
             overall_score INTEGER,
+            semantic_score INTEGER,
+            style_score INTEGER,
+            composition_score INTEGER,
             comment TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -786,6 +794,9 @@ def get_generation_runs(
         SELECT
             g.*,
             gr.overall_score,
+            gr.semantic_score,
+            gr.style_score,
+            gr.composition_score,
             gr.comment AS rating_comment,
             pe.parent_generation_id,
             pe.edit_kind,
@@ -816,11 +827,24 @@ def save_rating(
     generation_run_id: int,
     score: int,
     comment: str,
+    *,
+    semantic_score: Optional[int] = None,
+    style_score: Optional[int] = None,
+    composition_score: Optional[int] = None,
 ) -> None:
-    if score < 1 or score > 5:
-        raise ValueError(
-            "Score must be 1-5."
-        )
+    scores = {
+        "Overall score": score,
+        "Semantic score": semantic_score,
+        "Style score": style_score,
+        "Composition score": composition_score,
+    }
+    for label, value in scores.items():
+        if value is not None and (
+            value < 1 or value > 5
+        ):
+            raise ValueError(
+                f"{label} must be 1-5."
+            )
 
     conn = connect_db()
 
@@ -849,20 +873,29 @@ def save_rating(
             INSERT INTO generation_ratings(
                 generation_run_id,
                 overall_score,
+                semantic_score,
+                style_score,
+                composition_score,
                 comment,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(generation_run_id)
             DO UPDATE SET
                 overall_score=excluded.overall_score,
+                semantic_score=excluded.semantic_score,
+                style_score=excluded.style_score,
+                composition_score=excluded.composition_score,
                 comment=excluded.comment,
                 updated_at=excluded.updated_at
             """,
             (
                 generation_run_id,
                 score,
+                semantic_score,
+                style_score,
+                composition_score,
                 comment.strip(),
                 timestamp,
                 timestamp,
@@ -1523,6 +1556,8 @@ def parse_lora_slots(
 
 def config_for_form(
     form: Dict[str, List[str]],
+    *,
+    apply_selected_preset: bool = True,
 ) -> Dict[str, Any]:
     cfg = load_base_config()
 
@@ -1552,6 +1587,16 @@ def config_for_form(
     cfg[
         "use_lora_clip_for_negative"
     ] = True
+
+    if apply_selected_preset:
+        cfg = generator.apply_generation_preset(
+            cfg,
+            first_value(
+                form,
+                "generation_preset",
+                "current",
+            ),
+        )
 
     return cfg
 
@@ -1634,6 +1679,75 @@ def lora_slots_from_generation(
         }
 
     return slots
+
+
+def config_from_generation(
+    generation: sqlite3.Row,
+) -> Dict[str, Any]:
+    """Rebuild effective settings for a candidate revision."""
+
+    cfg = load_base_config()
+    cfg["lora_slots"] = lora_slots_from_generation(
+        str(generation["loras_json"] or "[]")
+    )
+    cfg["negative_prompt"] = str(
+        generation["negative_prompt"]
+        or ""
+    )
+    cfg["apply_lora_to_refiner"] = True
+    cfg["use_lora_clip_for_negative"] = True
+
+    try:
+        sampling = json.loads(
+            str(generation["sampling_json"] or "{}")
+        )
+    except Exception:
+        sampling = {}
+
+    if not isinstance(sampling, dict):
+        return cfg
+
+    mode = str(
+        sampling.get("mode", "")
+        or ""
+    ).strip().lower()
+    if mode in {"single", "dual"}:
+        cfg["sampling_mode"] = mode
+
+    overrides = {}
+    for key in ("base", "refiner"):
+        value = sampling.get(key)
+        if isinstance(value, dict):
+            overrides[key] = {
+                field: value[field]
+                for field in (
+                    "steps",
+                    "cfg",
+                    "sampler_name",
+                    "scheduler",
+                    "start_at_step",
+                    "end_at_step",
+                    "add_noise",
+                    "return_with_leftover_noise",
+                )
+                if field in value
+            }
+    if overrides:
+        cfg["sampling_overrides"] = overrides
+
+    resolution = sampling.get("resolution")
+    if isinstance(resolution, dict):
+        cfg["resolution"] = copy.deepcopy(
+            resolution
+        )
+
+    preset = sampling.get("preset")
+    if isinstance(preset, dict):
+        cfg["generation_preset"] = copy.deepcopy(
+            preset
+        )
+
+    return cfg
 
 
 # ============================================================
@@ -2206,6 +2320,29 @@ details > summary {
   flex-wrap: wrap;
 }
 
+.rating-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 9px 14px;
+}
+
+.rating-dimension {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.rating-dimension strong {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rating-scale {
+  display: flex;
+  gap: 6px;
+}
+
 .score {
   position: relative;
 }
@@ -2287,6 +2424,18 @@ details > summary {
   main {
     padding: 10px;
     padding-bottom: 100px;
+  }
+
+  .rating-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .rating-dimension {
+    grid-template-columns: 72px 1fr;
+  }
+
+  .score label {
+    width: 36px;
   }
 
   .workspace {
@@ -2504,6 +2653,79 @@ def diagnostic_summary(
             else ""
         )
     )
+
+
+def generation_preset_summary(
+    raw_json: Any,
+) -> str:
+    try:
+        sampling = json.loads(
+            raw_json
+            or "{}"
+        )
+    except Exception:
+        return ""
+
+    if not isinstance(sampling, dict):
+        return ""
+
+    preset = sampling.get("preset")
+    if not isinstance(preset, dict):
+        return ""
+
+    label = str(
+        preset.get("label", "")
+        or ""
+    ).strip()
+    preset_id = str(
+        preset.get("id", "")
+        or ""
+    ).strip()
+
+    if not label and not preset_id:
+        return ""
+
+    return (
+        f"Preset: {label}"
+        if label
+        else f"Preset: {preset_id}"
+    )
+
+
+def rating_scale_html(
+    generation_id: int,
+    field_name: str,
+    current_score: Optional[int],
+) -> str:
+    buttons = []
+
+    for value in range(1, 6):
+        checked = (
+            " checked"
+            if current_score == value
+            else ""
+        )
+        control_id = (
+            f"g{generation_id}_"
+            f"{field_name}_{value}"
+        )
+        buttons.append(
+            f"""
+            <span class="score">
+              <input
+                id="{control_id}"
+                type="radio"
+                name="{field_name}"
+                value="{value}"
+                {checked}
+                required
+              >
+              <label for="{control_id}">{value}</label>
+            </span>
+            """
+        )
+
+    return "".join(buttons)
 
 
 def json_list_to_text(
@@ -3304,40 +3526,26 @@ def page_html(
             ]
         )
 
-        score = row[
-            "overall_score"
-        ]
-
-        score_buttons = []
-
-        for value in range(
-            1,
-            6,
-        ):
-            checked = (
-                " checked"
-                if score
-                == value
-                else ""
-            )
-
-            score_buttons.append(
-                f"""
-                <span class="score">
-                  <input
-                    id="g{gid}s{value}"
-                    type="radio"
-                    name="score"
-                    value="{value}"
-                    {checked}
-                    required
-                  >
-                  <label for="g{gid}s{value}">
-                    {value}
-                  </label>
-                </span>
-                """
-            )
+        overall_buttons = rating_scale_html(
+            gid,
+            "overall_score",
+            row["overall_score"],
+        )
+        semantic_buttons = rating_scale_html(
+            gid,
+            "semantic_score",
+            row["semantic_score"],
+        )
+        style_buttons = rating_scale_html(
+            gid,
+            "style_score",
+            row["style_score"],
+        )
+        composition_buttons = rating_scale_html(
+            gid,
+            "composition_score",
+            row["composition_score"],
+        )
 
         parent_text = (
             f" · revision of "
@@ -3372,6 +3580,17 @@ def page_html(
             if diagnostic_text
             else ""
         )
+        preset_text = generation_preset_summary(
+            row["sampling_json"]
+        )
+        preset_badge = (
+            "<div class='small status-good' "
+            "style='margin-top:5px'>"
+            f"{esc(preset_text)}"
+            "</div>"
+            if preset_text
+            else ""
+        )
 
         candidate_cards.append(
             f"""
@@ -3392,6 +3611,7 @@ def page_html(
                 · {esc(lora_summary(row['loras_json']))}
                 · {esc(row['elapsed_seconds'])} sec
                 {diagnostic_badge}
+                {preset_badge}
                 {correction_badge}
 
                 <details style="margin-top:7px">
@@ -3419,11 +3639,26 @@ def page_html(
                     value="{gid}"
                   >
 
-                  <div class="rating-row">
-                    <strong>相似度</strong>
+                  <div class="rating-grid">
+                    <div class="rating-dimension">
+                      <strong>总体</strong>
+                      <div class="rating-scale">{overall_buttons}</div>
+                    </div>
+                    <div class="rating-dimension">
+                      <strong>内容还原</strong>
+                      <div class="rating-scale">{semantic_buttons}</div>
+                    </div>
+                    <div class="rating-dimension">
+                      <strong>风格还原</strong>
+                      <div class="rating-scale">{style_buttons}</div>
+                    </div>
+                    <div class="rating-dimension">
+                      <strong>构图还原</strong>
+                      <div class="rating-scale">{composition_buttons}</div>
+                    </div>
+                  </div>
 
-                    {''.join(score_buttons)}
-
+                  <div class="rating-row" style="margin-top:9px">
                     <input
                       class="rating-comment"
                       type="text"
@@ -3521,6 +3756,27 @@ def page_html(
         state.get(
             "count",
             5,
+        )
+    )
+
+    generation_preset_default = str(
+        state.get(
+            "generation_preset",
+            "current",
+        )
+        or "current"
+    )
+    if generation_preset_default not in (
+        generator.GENERATION_PRESETS
+    ):
+        generation_preset_default = "current"
+
+    generation_preset_options = "".join(
+        f"<option value='{esc(preset_id)}' "
+        f"{'selected' if preset_id == generation_preset_default else ''}>"
+        f"{esc(definition['label'])}</option>"
+        for preset_id, definition in (
+            generator.GENERATION_PRESETS.items()
         )
     )
 
@@ -3686,6 +3942,13 @@ def page_html(
             <h2>Generation Settings</h2>
 
             <div class="toolbar">
+              <div class="field grow">
+                <label>生成预设</label>
+                <select name="generation_preset">
+                  {generation_preset_options}
+                </select>
+              </div>
+
               <div class="field">
                 <label>生成数量</label>
 
@@ -3723,6 +3986,13 @@ def page_html(
                   placeholder="同一 seed 生成 A / B / C / D / E"
                 >
               </div>
+            </div>
+
+            <div class="small" style="margin-top:10px">
+              当前设置：保留 LoRA 与现有双 sampler；平衡重建：关闭 LoRA、
+              单 sampler、35 steps、CFG 6、原图纵横比；半写实增强：
+              在平衡重建上追加加权绘画式风格词。后两种预设会忽略下方 LoRA 开关，
+              但不会删除你保存的 LoRA 配置。
             </div>
 
             <div class="small" style="margin-top:10px">
@@ -4922,7 +5192,8 @@ class Handler(
 
                 try:
                     cfg = config_for_form(
-                        form
+                        form,
+                        apply_selected_preset=False,
                     )
 
                     final_prompt = first_value(
@@ -5209,13 +5480,29 @@ class Handler(
                         )
                     )
 
+                    effective_final_prompt = (
+                        str(
+                            results[0].get(
+                                "prompt",
+                                final_prompt,
+                            )
+                        )
+                        if results
+                        else final_prompt
+                    )
+
                     edit_kind = (
                         "edited"
                         if (
                             final_prompt.strip()
                             != analyzer_prompt.strip()
                         )
-                        else "base"
+                        else (
+                            "preset"
+                            if effective_final_prompt.strip()
+                            != analyzer_prompt.strip()
+                            else "base"
+                        )
                     )
 
                     save_prompt_edit_records(
@@ -5241,7 +5528,7 @@ class Handler(
                             manual_positive
                         ),
                         final_prompt=(
-                            final_prompt
+                            effective_final_prompt
                         ),
                     )
 
@@ -5250,13 +5537,22 @@ class Handler(
                     )
 
                     state.update({
-                        "lora_slots": cfg[
-                            "lora_slots"
-                        ],
+                        "lora_slots": parse_lora_slots(
+                            form
+                        ),
                         "negative_prompt": cfg[
                             "negative_prompt"
                         ],
                         "count": count,
+                        "generation_preset": str(
+                            cfg.get(
+                                "generation_preset",
+                                {},
+                            ).get(
+                                "id",
+                                "current",
+                            )
+                        ),
                         "last_run_id": run_id,
                         "correction_model": (
                             correction_model
@@ -5360,20 +5656,6 @@ class Handler(
                             or ""
                         )
 
-                        parent_negative = str(
-                            parent[
-                                "negative_prompt"
-                            ]
-                            or ""
-                        )
-
-                        parent_loras = str(
-                            parent[
-                                "loras_json"
-                            ]
-                            or "[]"
-                        )
-
                     finally:
                         conn.close()
 
@@ -5422,29 +5704,9 @@ class Handler(
                         )
                     )
 
-                    cfg = load_base_config()
-
-                    cfg[
-                        "lora_slots"
-                    ] = (
-                        lora_slots_from_generation(
-                            parent_loras
-                        )
+                    cfg = config_from_generation(
+                        parent
                     )
-
-                    cfg[
-                        "negative_prompt"
-                    ] = (
-                        parent_negative
-                    )
-
-                    cfg[
-                        "apply_lora_to_refiner"
-                    ] = True
-
-                    cfg[
-                        "use_lora_clip_for_negative"
-                    ] = True
 
                     results = (
                         generator.generate_candidates(
@@ -5541,7 +5803,25 @@ class Handler(
                 score = int(
                     first_value(
                         form,
-                        "score",
+                        "overall_score",
+                    )
+                )
+                semantic_score = int(
+                    first_value(
+                        form,
+                        "semantic_score",
+                    )
+                )
+                style_score = int(
+                    first_value(
+                        form,
+                        "style_score",
+                    )
+                )
+                composition_score = int(
+                    first_value(
+                        form,
+                        "composition_score",
                     )
                 )
 
@@ -5555,6 +5835,9 @@ class Handler(
                     generation_id,
                     score,
                     comment,
+                    semantic_score=semantic_score,
+                    style_score=style_score,
+                    composition_score=composition_score,
                 )
 
                 state = load_ui_state(
@@ -5575,7 +5858,11 @@ class Handler(
                         "run_id": run_id,
                         "message": (
                             f"Generation #{generation_id} "
-                            f"评分已保存：{score}/5"
+                            "评分已保存："
+                            f"总体 {score}/5 · "
+                            f"内容 {semantic_score}/5 · "
+                            f"风格 {style_score}/5 · "
+                            f"构图 {composition_score}/5"
                         ),
                     },
                 )
