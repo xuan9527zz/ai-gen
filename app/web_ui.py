@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.2.1
+Illustrious Reconstruction Studio v2.3.0
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
@@ -101,6 +101,7 @@ if str(BASE_DIR) not in sys.path:
 from . import generator  # noqa: E402
 from . import analyzer  # noqa: E402
 from . import database as analysis_db  # noqa: E402
+from . import character_resolver  # noqa: E402
 
 
 HOST = "0.0.0.0"
@@ -109,6 +110,7 @@ PORT = 8765
 GENERATION_LOCK = threading.Lock()
 ANALYSIS_LOCK = threading.Lock()
 CORRECTION_LOCK = threading.Lock()
+CHARACTER_LOCK = threading.Lock()
 
 ALLOWED_IMAGE_EXTENSIONS = {
     ".jpg",
@@ -565,6 +567,11 @@ CREATE TABLE IF NOT EXISTS generation_prompt_edits (
     ai_add_tags_json TEXT NOT NULL DEFAULT '[]',
     ai_remove_tags_json TEXT NOT NULL DEFAULT '[]',
 
+    character_query TEXT,
+    character_tag TEXT,
+    character_remove_tags_json TEXT NOT NULL DEFAULT '[]',
+    character_verification_json TEXT NOT NULL DEFAULT '{}',
+
     manual_positive TEXT,
     final_generation_prompt TEXT NOT NULL,
 
@@ -582,6 +589,29 @@ CREATE TABLE IF NOT EXISTS generation_prompt_edits (
 CREATE INDEX IF NOT EXISTS idx_prompt_edits_parent
 ON generation_prompt_edits(parent_generation_id);
 """
+
+
+def migrate_studio_schema(
+    conn: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row["name"])
+        for row in conn.execute(
+            "PRAGMA table_info(generation_prompt_edits)"
+        ).fetchall()
+    }
+    additions = {
+        "character_query": "TEXT",
+        "character_tag": "TEXT",
+        "character_remove_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+        "character_verification_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE generation_prompt_edits "
+                f"ADD COLUMN {name} {definition}"
+            )
 
 
 def db_path_from_config() -> Path:
@@ -637,6 +667,10 @@ def connect_db() -> sqlite3.Connection:
 
     conn.executescript(
         STUDIO_SCHEMA
+    )
+
+    migrate_studio_schema(
+        conn
     )
 
     conn.execute(
@@ -775,9 +809,16 @@ def get_generation_run(
 ) -> Optional[sqlite3.Row]:
     return conn.execute(
         """
-        SELECT *
-        FROM generation_runs
-        WHERE id=?
+        SELECT
+            g.*,
+            pe.character_query,
+            pe.character_tag,
+            pe.character_remove_tags_json,
+            pe.character_verification_json
+        FROM generation_runs g
+        LEFT JOIN generation_prompt_edits pe
+          ON pe.generation_run_id=g.id
+        WHERE g.id=?
         """,
         (
             generation_id,
@@ -805,6 +846,10 @@ def get_generation_runs(
             pe.correction_model,
             pe.ai_add_tags_json,
             pe.ai_remove_tags_json,
+            pe.character_query,
+            pe.character_tag,
+            pe.character_remove_tags_json,
+            pe.character_verification_json,
             pe.manual_positive
         FROM generation_runs g
         LEFT JOIN generation_ratings gr
@@ -921,6 +966,10 @@ def save_prompt_edit_records(
     ai_remove_tags: List[str],
     manual_positive: str,
     final_prompt: str,
+    character_query: str = "",
+    character_tag: str = "",
+    character_remove_tags: Optional[List[str]] = None,
+    character_verification: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not generation_results:
         return
@@ -946,11 +995,15 @@ def save_prompt_edit_records(
                     correction_model,
                     ai_add_tags_json,
                     ai_remove_tags_json,
+                    character_query,
+                    character_tag,
+                    character_remove_tags_json,
+                    character_verification_json,
                     manual_positive,
                     final_generation_prompt,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(generation_run_id)
                 DO UPDATE SET
                     parent_generation_id=excluded.parent_generation_id,
@@ -960,6 +1013,10 @@ def save_prompt_edit_records(
                     correction_model=excluded.correction_model,
                     ai_add_tags_json=excluded.ai_add_tags_json,
                     ai_remove_tags_json=excluded.ai_remove_tags_json,
+                    character_query=excluded.character_query,
+                    character_tag=excluded.character_tag,
+                    character_remove_tags_json=excluded.character_remove_tags_json,
+                    character_verification_json=excluded.character_verification_json,
                     manual_positive=excluded.manual_positive,
                     final_generation_prompt=excluded.final_generation_prompt
                 """,
@@ -976,6 +1033,16 @@ def save_prompt_edit_records(
                     ),
                     json.dumps(
                         ai_remove_tags,
+                        ensure_ascii=False,
+                    ),
+                    character_query.strip(),
+                    character_tag.strip(),
+                    json.dumps(
+                        character_remove_tags or [],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        character_verification or {},
                         ensure_ascii=False,
                     ),
                     manual_positive.strip(),
@@ -1429,6 +1496,31 @@ def ai_prompt_correction(
         "error": "",
         "model": model,
     }
+
+
+def character_override_from_form(
+    form: Dict[str, List[str]],
+    *,
+    base_prompt: str,
+    final_prompt: str,
+) -> Dict[str, Any]:
+    return character_resolver.validate_character_override(
+        query=first_value(form, "character_query", ""),
+        resolved_tag=first_value(
+            form,
+            "resolved_character_tag",
+            "",
+        ),
+        remove_tags=split_prompt_fragments(
+            first_value(
+                form,
+                "character_remove_tags",
+                "",
+            )
+        ),
+        base_prompt=base_prompt,
+        final_prompt=final_prompt,
+    )
 
 
 # ============================================================
@@ -3629,6 +3721,17 @@ def page_html(
                 "</div>"
             )
 
+        character_badge = ""
+        if row["character_tag"]:
+            character_badge = (
+                "<div class='small status-good' "
+                "style='margin-top:5px'>"
+                "Character override: "
+                f"{esc(row['character_query'])} → "
+                f"{esc(row['character_tag'])}"
+                "</div>"
+            )
+
         diagnostic_text = diagnostic_summary(
             row["sampling_json"]
         )
@@ -3673,6 +3776,7 @@ def page_html(
                 {diagnostic_badge}
                 {preset_badge}
                 {correction_badge}
+                {character_badge}
 
                 <details style="margin-top:7px">
                   <summary>实际生成 Prompt</summary>
@@ -3888,6 +3992,65 @@ def page_html(
 
           <div class="panel" id="prompt-editor">
             <h2>Prompt 编辑 / 更正</h2>
+
+            <div class="field">
+              <label>
+                指定人物（会安全替换已识别的原人物 tag）
+              </label>
+
+              <div class="toolbar">
+                <div class="field grow">
+                  <input
+                    id="character-query"
+                    name="character_query"
+                    type="text"
+                    placeholder="例如：宝可梦 莉莉艾；火焰纹章 艾黛尔贾特"
+                    oninput="clearCharacterResolution()"
+                  >
+                </div>
+
+                <button
+                  id="character-resolve-button"
+                  type="button"
+                  class="secondary"
+                  onclick="resolveCharacter()"
+                >
+                  解析并替换人物
+                </button>
+              </div>
+
+              <input
+                id="resolved-character-tag"
+                name="resolved_character_tag"
+                type="hidden"
+                value=""
+              >
+
+              <input
+                id="character-remove-tags"
+                name="character_remove_tags"
+                type="hidden"
+                value=""
+              >
+
+              <div
+                id="character-note"
+                class="ai-note"
+              ></div>
+
+              <div class="small muted">
+                中文名、常见译名和轻微误差先由本地模型理解；只有通过
+                NAID character exact-match 的 Danbooru tag 才会自动写入。
+              </div>
+            </div>
+
+            <hr
+              style="
+                border:0;
+                border-top:1px solid var(--border);
+                margin:14px 0;
+              "
+            >
 
             <div class="field">
               <label>
@@ -4140,7 +4303,7 @@ def page_html(
 <header>
   <div class="header-inner">
     <div>
-      <h1>Illustrious Reconstruction Studio v2.1</h1>
+      <h1>Illustrious Reconstruction Studio v2.3</h1>
       <div class="header-sub">
         Analyze · Correct · Generate · Compare · Learn
       </div>
@@ -4352,6 +4515,12 @@ function refreshPromptPreview() {{
   const base = document.getElementById('base-prompt');
   const add = document.getElementById('ai-add-tags');
   const remove = document.getElementById('ai-remove-tags');
+  const characterTag = document.getElementById(
+    'resolved-character-tag'
+  );
+  const characterRemove = document.getElementById(
+    'character-remove-tags'
+  );
   const manual = document.getElementById('manual-positive');
   const finalBox = document.getElementById('final-prompt');
 
@@ -4359,10 +4528,75 @@ function refreshPromptPreview() {{
 
   finalBox.value = buildEditedPrompt(
     base.value,
-    remove ? remove.value : '',
-    add ? add.value : '',
+    [
+      characterRemove ? characterRemove.value : '',
+      remove ? remove.value : ''
+    ].filter(Boolean).join(', '),
+    [
+      characterTag ? characterTag.value : '',
+      add ? add.value : ''
+    ].filter(Boolean).join(', '),
     manual ? manual.value : ''
   );
+}}
+
+function clearCharacterResolution() {{
+  const tag = document.getElementById('resolved-character-tag');
+  const remove = document.getElementById('character-remove-tags');
+  const note = document.getElementById('character-note');
+  if (tag) tag.value = '';
+  if (remove) remove.value = '';
+  if (note) note.textContent = '';
+  refreshPromptPreview();
+}}
+
+async function resolveCharacter() {{
+  const query = document.getElementById('character-query');
+  const base = document.getElementById('base-prompt');
+  const model = document.getElementById('correction-model');
+  const tag = document.getElementById('resolved-character-tag');
+  const remove = document.getElementById('character-remove-tags');
+  const note = document.getElementById('character-note');
+  const button = document.getElementById('character-resolve-button');
+
+  if (!query || !query.value.trim()) {{
+    alert('请输入作品名和人物名，例如：宝可梦 莉莉艾。');
+    return;
+  }}
+
+  tag.value = '';
+  remove.value = '';
+  note.textContent = '正在用本地模型解析，并核验 Danbooru character tag…';
+  button.disabled = true;
+
+  try {{
+    const response = await fetch('/api/resolve-character', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        query: query.value,
+        base_prompt: base ? base.value : '',
+        model: model ? model.value : ''
+      }})
+    }});
+    const data = await response.json();
+    if (!response.ok || data.error) {{
+      throw new Error(data.error || '人物解析失败。');
+    }}
+
+    tag.value = data.resolved_tag || '';
+    remove.value = (data.remove_tags || []).join(', ');
+    const removed = (data.remove_tags || []).length
+      ? '；替换原人物：' + data.remove_tags.join(', ')
+      : '；未发现需要移除的原人物 tag';
+    note.textContent = '已验证：' + data.resolved_tag + removed;
+    refreshPromptPreview();
+  }} catch (error) {{
+    note.textContent = '未修改 Prompt：' + error.message;
+    refreshPromptPreview();
+  }} finally {{
+    button.disabled = false;
+  }}
 }}
 
 function resetPromptEditor() {{
@@ -4373,12 +4607,20 @@ function resetPromptEditor() {{
   const manual = document.getElementById('manual-positive');
   const finalBox = document.getElementById('final-prompt');
   const note = document.getElementById('ai-note');
+  const characterQuery = document.getElementById('character-query');
+  const characterTag = document.getElementById('resolved-character-tag');
+  const characterRemove = document.getElementById('character-remove-tags');
+  const characterNote = document.getElementById('character-note');
 
   if (instruction) instruction.value = '';
   if (add) add.value = '';
   if (remove) remove.value = '';
   if (manual) manual.value = '';
   if (note) note.textContent = '';
+  if (characterQuery) characterQuery.value = '';
+  if (characterTag) characterTag.value = '';
+  if (characterRemove) characterRemove.value = '';
+  if (characterNote) characterNote.textContent = '';
   if (base && finalBox) finalBox.value = base.value;
 }}
 
@@ -4475,12 +4717,32 @@ function loadGenerationPrompt(prompt) {{
     'manual-positive'
   );
 
+  const characterQuery = document.getElementById(
+    'character-query'
+  );
+
+  const characterTag = document.getElementById(
+    'resolved-character-tag'
+  );
+
+  const characterRemove = document.getElementById(
+    'character-remove-tags'
+  );
+
+  const characterNote = document.getElementById(
+    'character-note'
+  );
+
   if (base) base.value = prompt;
   if (finalBox) finalBox.value = prompt;
   if (instruction) instruction.value = '';
   if (add) add.value = '';
   if (remove) remove.value = '';
   if (manual) manual.value = '';
+  if (characterQuery) characterQuery.value = '';
+  if (characterTag) characterTag.value = '';
+  if (characterRemove) characterRemove.value = '';
+  if (characterNote) characterNote.textContent = '';
 
   document.getElementById(
     'prompt-editor'
@@ -5086,6 +5348,62 @@ class Handler(
         )
 
         # ----------------------------------------------------
+        # JSON: fuzzy character name -> verified Danbooru tag
+        # ----------------------------------------------------
+
+        if parsed.path == "/api/resolve-character":
+            try:
+                length = int(
+                    self.headers.get(
+                        "Content-Length",
+                        "0",
+                    )
+                    or "0"
+                )
+                payload = json.loads(
+                    self.rfile.read(length).decode("utf-8")
+                    or "{}"
+                )
+
+                if not CHARACTER_LOCK.acquire(blocking=False):
+                    self.send_json(
+                        {"error": "另一个人物解析任务正在运行。"},
+                        status=409,
+                    )
+                    return
+
+                try:
+                    result = character_resolver.resolve_character(
+                        query=str(payload.get("query", "")),
+                        base_prompt=str(payload.get("base_prompt", "")),
+                        model=str(
+                            payload.get(
+                                "model",
+                                DEFAULT_CORRECTION_MODEL,
+                            )
+                        ),
+                        ollama_url=OLLAMA_URL,
+                    )
+                finally:
+                    CHARACTER_LOCK.release()
+
+                self.send_json(
+                    result,
+                    status=400 if result.get("error") else 200,
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                self.send_json(
+                    {
+                        "error": (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    },
+                    status=500,
+                )
+            return
+
+        # ----------------------------------------------------
         # JSON: AI correction preview
         # ----------------------------------------------------
 
@@ -5479,6 +5797,12 @@ class Handler(
                     finally:
                         conn.close()
 
+                    character_override = character_override_from_form(
+                        form,
+                        base_prompt=analyzer_prompt,
+                        final_prompt=final_prompt,
+                    )
+
                     results = generator.generate_diagnostic_abcde(
                         run_id=run_id,
                         cfg=cfg,
@@ -5509,6 +5833,25 @@ class Handler(
                                     final_prompt,
                                 )
                             ),
+                            character_query=str(
+                                character_override.get("query", "")
+                            ),
+                            character_tag=str(
+                                character_override.get("resolved_tag", "")
+                            ),
+                            character_remove_tags=list(
+                                character_override.get("remove_tags", [])
+                            ),
+                            character_verification={
+                                "verification": character_override.get(
+                                    "verification",
+                                    {},
+                                ),
+                                "removal_verifications": character_override.get(
+                                    "removal_verifications",
+                                    [],
+                                ),
+                            } if character_override else {},
                         )
 
                     state = load_ui_state(
@@ -5680,6 +6023,12 @@ class Handler(
                     finally:
                         conn.close()
 
+                    character_override = character_override_from_form(
+                        form,
+                        base_prompt=analyzer_prompt,
+                        final_prompt=final_prompt,
+                    )
+
                     results = (
                         generator.generate_candidates(
                             run_id=run_id,
@@ -5741,6 +6090,25 @@ class Handler(
                         final_prompt=(
                             effective_final_prompt
                         ),
+                        character_query=str(
+                            character_override.get("query", "")
+                        ),
+                        character_tag=str(
+                            character_override.get("resolved_tag", "")
+                        ),
+                        character_remove_tags=list(
+                            character_override.get("remove_tags", [])
+                        ),
+                        character_verification={
+                            "verification": character_override.get(
+                                "verification",
+                                {},
+                            ),
+                            "removal_verifications": character_override.get(
+                                "removal_verifications",
+                                [],
+                            ),
+                        } if character_override else {},
                     )
 
                     state = load_ui_state(
@@ -5867,6 +6235,25 @@ class Handler(
                             or ""
                         )
 
+                        inherited_character_query = str(
+                            parent["character_query"] or ""
+                        )
+                        inherited_character_tag = str(
+                            parent["character_tag"] or ""
+                        )
+                        try:
+                            inherited_character_remove_tags = json.loads(
+                                parent["character_remove_tags_json"] or "[]"
+                            )
+                        except Exception:
+                            inherited_character_remove_tags = []
+                        try:
+                            inherited_character_verification = json.loads(
+                                parent["character_verification_json"] or "{}"
+                            )
+                        except Exception:
+                            inherited_character_verification = {}
+
                     finally:
                         conn.close()
 
@@ -5915,6 +6302,16 @@ class Handler(
                         )
                     )
 
+                    corrected_keys = {
+                        normalize_tag_key(item)
+                        for item in split_prompt_fragments(corrected_prompt)
+                    }
+                    if normalize_tag_key(inherited_character_tag) not in corrected_keys:
+                        inherited_character_query = ""
+                        inherited_character_tag = ""
+                        inherited_character_remove_tags = []
+                        inherited_character_verification = {}
+
                     cfg = config_from_generation(
                         parent
                     )
@@ -5958,6 +6355,18 @@ class Handler(
                         manual_positive="",
                         final_prompt=(
                             corrected_prompt
+                        ),
+                        character_query=inherited_character_query,
+                        character_tag=inherited_character_tag,
+                        character_remove_tags=(
+                            inherited_character_remove_tags
+                            if isinstance(inherited_character_remove_tags, list)
+                            else []
+                        ),
+                        character_verification=(
+                            inherited_character_verification
+                            if isinstance(inherited_character_verification, dict)
+                            else {}
                         ),
                     )
 

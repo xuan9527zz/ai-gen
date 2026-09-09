@@ -2,7 +2,7 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.5**
+当前打包版本：**v0.5.6**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
@@ -23,6 +23,8 @@
 - 固定 Prompt / seed 的 A–E 生成质量诊断
 - 当前设置 / 平衡重建 / 半写实增强三种生成预设
 - 自然语言 Prompt 更正
+- 中文/别名/轻微误差人物输入 → Danbooru character tag → NAID 精确验证
+- 已验证的人物覆盖与原人物 tag 安全替换，并保存完整 provenance
 - Manual Positive Prompt
 - 原图 / 生成图对比
 - 总体 / 内容 / 风格 / 构图四项 1–5 分评分与备注
@@ -39,6 +41,7 @@ illustrious-reconstruction-studio/
 │  ├─ database.py
 │  ├─ image_inputs.py
 │  ├─ source_tags.py
+│  ├─ character_resolver.py
 │  ├─ naid_verifier.py
 │  └─ web_ui.py
 ├─ config/
@@ -309,6 +312,21 @@ visual_features_raw             = 两者合并后的过滤输入
 识图、生图、A–E 诊断和候选更正通过网页后台请求提交。当前页面不会再跳入空白
 等待状态，而会显示阶段动画和真实等待秒数；任务完成后自动载入结果。进度条为
 不确定进度动画，不伪造 ComfyUI 尚未提供的采样百分比。
+
+Prompt 编辑区的“指定人物”支持中文名、常见译名、作品简称和轻微输入误差。
+处理链路是：
+
+```text
+人物输入
+→ 本地 Qwen 生成完整 Danbooru character tag 候选
+→ NAID 同站候选纠正（仅在简写/拼写候选精确匹配失败时）
+→ NAID Tag Suggest exact-match + character category 验证
+→ 移除已验证的原人物 tag，并写入新人物 tag
+```
+
+例如 `宝可梦 莉莉艾` 会解析为 `lillie (pokemon)`。人物候选、被替换的原人物
+tag 和验证结果会写入 `generation_prompt_edits`；未验证候选不会自动加入 Final
+Prompt。
 
 在 Generation Settings 中可填写一个固定 seed，然后点击 `A–E 质量诊断`。
 Studio 会顺序生成五张图：
