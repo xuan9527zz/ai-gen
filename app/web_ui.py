@@ -5198,15 +5198,21 @@ function hideJobProgress() {{
   }}
 }}
 
+function resolveSubmitAction(form, submitter) {{
+  if (
+    submitter
+    && submitter.hasAttribute('formaction')
+  ) {{
+    return submitter.formAction;
+  }}
+  return form.action;
+}}
+
 async function submitWithProgress(event, form, fallbackText) {{
   event.preventDefault();
 
   const submitter = event.submitter;
-  const action = (
-    submitter && submitter.formAction
-      ? submitter.formAction
-      : form.action
-  );
+  const action = resolveSubmitAction(form, submitter);
   const method = String(form.method || 'POST').toUpperCase();
   const formData = new FormData(form);
   let body;
