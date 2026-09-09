@@ -2,7 +2,7 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.6**
+当前打包版本：**v0.5.7**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
@@ -25,6 +25,7 @@
 - 自然语言 Prompt 更正
 - 中文/别名/轻微误差人物输入 → Danbooru character tag → NAID 精确验证
 - 已验证的人物覆盖与原人物 tag 安全替换，并保存完整 provenance
+- 保留原图造型 / 优先角色原设两种人物覆盖模式与本地人物解析缓存
 - Manual Positive Prompt
 - 原图 / 生成图对比
 - 总体 / 内容 / 风格 / 构图四项 1–5 分评分与备注
@@ -321,12 +322,19 @@ Prompt 编辑区的“指定人物”支持中文名、常见译名、作品简�
 → 本地 Qwen 生成完整 Danbooru character tag 候选
 → NAID 同站候选纠正（仅在简写/拼写候选精确匹配失败时）
 → NAID Tag Suggest exact-match + character category 验证
-→ 移除已验证的原人物 tag，并写入新人物 tag
+→ 按模式预览并移除原人物/外观约束 tags
+→ 写入新人物 tag
 ```
 
 例如 `宝可梦 莉莉艾` 会解析为 `lillie (pokemon)`。人物候选、被替换的原人物
 tag 和验证结果会写入 `generation_prompt_edits`；未验证候选不会自动加入 Final
 Prompt。
+
+“只换身份，保留原图造型”仅替换已验证的原人物 tag。“优先角色原设”还会
+确定性移除原图中的发色、瞳色、发型、服装与佩饰约束，让角色 tag 主导人物
+设计；动作、构图、背景、光照、渲染风格和身体/行为 tags 不受影响。解析成功的
+中文别名与同一 Prompt 的修改计划保存在本地 `data/character_resolution_cache.json`
+中，后续可直接命中；UI 也提供“忽略本地人物缓存，重新解析”。
 
 在 Generation Settings 中可填写一个固定 seed，然后点击 `A–E 质量诊断`。
 Studio 会顺序生成五张图：

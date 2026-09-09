@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.3.0
+Illustrious Reconstruction Studio v2.3.1
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
@@ -569,6 +569,9 @@ CREATE TABLE IF NOT EXISTS generation_prompt_edits (
 
     character_query TEXT,
     character_tag TEXT,
+    character_mode TEXT NOT NULL DEFAULT 'identity_only',
+    character_identity_remove_tags_json TEXT NOT NULL DEFAULT '[]',
+    character_appearance_remove_tags_json TEXT NOT NULL DEFAULT '[]',
     character_remove_tags_json TEXT NOT NULL DEFAULT '[]',
     character_verification_json TEXT NOT NULL DEFAULT '{}',
 
@@ -603,6 +606,9 @@ def migrate_studio_schema(
     additions = {
         "character_query": "TEXT",
         "character_tag": "TEXT",
+        "character_mode": "TEXT NOT NULL DEFAULT 'identity_only'",
+        "character_identity_remove_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+        "character_appearance_remove_tags_json": "TEXT NOT NULL DEFAULT '[]'",
         "character_remove_tags_json": "TEXT NOT NULL DEFAULT '[]'",
         "character_verification_json": "TEXT NOT NULL DEFAULT '{}'",
     }
@@ -813,6 +819,9 @@ def get_generation_run(
             g.*,
             pe.character_query,
             pe.character_tag,
+            pe.character_mode,
+            pe.character_identity_remove_tags_json,
+            pe.character_appearance_remove_tags_json,
             pe.character_remove_tags_json,
             pe.character_verification_json
         FROM generation_runs g
@@ -848,6 +857,9 @@ def get_generation_runs(
             pe.ai_remove_tags_json,
             pe.character_query,
             pe.character_tag,
+            pe.character_mode,
+            pe.character_identity_remove_tags_json,
+            pe.character_appearance_remove_tags_json,
             pe.character_remove_tags_json,
             pe.character_verification_json,
             pe.manual_positive
@@ -968,6 +980,9 @@ def save_prompt_edit_records(
     final_prompt: str,
     character_query: str = "",
     character_tag: str = "",
+    character_mode: str = "identity_only",
+    character_identity_remove_tags: Optional[List[str]] = None,
+    character_appearance_remove_tags: Optional[List[str]] = None,
     character_remove_tags: Optional[List[str]] = None,
     character_verification: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -997,13 +1012,16 @@ def save_prompt_edit_records(
                     ai_remove_tags_json,
                     character_query,
                     character_tag,
+                    character_mode,
+                    character_identity_remove_tags_json,
+                    character_appearance_remove_tags_json,
                     character_remove_tags_json,
                     character_verification_json,
                     manual_positive,
                     final_generation_prompt,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(generation_run_id)
                 DO UPDATE SET
                     parent_generation_id=excluded.parent_generation_id,
@@ -1015,6 +1033,9 @@ def save_prompt_edit_records(
                     ai_remove_tags_json=excluded.ai_remove_tags_json,
                     character_query=excluded.character_query,
                     character_tag=excluded.character_tag,
+                    character_mode=excluded.character_mode,
+                    character_identity_remove_tags_json=excluded.character_identity_remove_tags_json,
+                    character_appearance_remove_tags_json=excluded.character_appearance_remove_tags_json,
                     character_remove_tags_json=excluded.character_remove_tags_json,
                     character_verification_json=excluded.character_verification_json,
                     manual_positive=excluded.manual_positive,
@@ -1037,6 +1058,15 @@ def save_prompt_edit_records(
                     ),
                     character_query.strip(),
                     character_tag.strip(),
+                    character_mode.strip() or "identity_only",
+                    json.dumps(
+                        character_identity_remove_tags or [],
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        character_appearance_remove_tags or [],
+                        ensure_ascii=False,
+                    ),
                     json.dumps(
                         character_remove_tags or [],
                         ensure_ascii=False,
@@ -1514,12 +1544,24 @@ def character_override_from_form(
         remove_tags=split_prompt_fragments(
             first_value(
                 form,
-                "character_remove_tags",
+                "character_identity_remove_tags",
                 "",
             )
         ),
         base_prompt=base_prompt,
         final_prompt=final_prompt,
+        appearance_remove_tags=split_prompt_fragments(
+            first_value(
+                form,
+                "character_appearance_remove_tags",
+                "",
+            )
+        ),
+        mode=first_value(
+            form,
+            "character_mode",
+            "identity_only",
+        ),
     )
 
 
@@ -3723,12 +3765,18 @@ def page_html(
 
         character_badge = ""
         if row["character_tag"]:
+            character_mode_label = (
+                "优先角色原设"
+                if row["character_mode"] == "canonical"
+                else "保留原图造型"
+            )
             character_badge = (
                 "<div class='small status-good' "
                 "style='margin-top:5px'>"
                 "Character override: "
                 f"{esc(row['character_query'])} → "
                 f"{esc(row['character_tag'])}"
+                f"（{esc(character_mode_label)}）"
                 "</div>"
             )
 
@@ -4009,6 +4057,22 @@ def page_html(
                   >
                 </div>
 
+                <div class="field grow">
+                  <label>替换方式</label>
+                  <select
+                    id="character-mode"
+                    name="character_mode"
+                    onchange="clearCharacterResolution()"
+                  >
+                    <option value="identity_only" selected>
+                      只换身份，保留原图造型
+                    </option>
+                    <option value="canonical">
+                      优先角色原设
+                    </option>
+                  </select>
+                </div>
+
                 <button
                   id="character-resolve-button"
                   type="button"
@@ -4022,6 +4086,20 @@ def page_html(
               <input
                 id="resolved-character-tag"
                 name="resolved_character_tag"
+                type="hidden"
+                value=""
+              >
+
+              <input
+                id="character-identity-remove-tags"
+                name="character_identity_remove_tags"
+                type="hidden"
+                value=""
+              >
+
+              <input
+                id="character-appearance-remove-tags"
+                name="character_appearance_remove_tags"
                 type="hidden"
                 value=""
               >
@@ -4041,7 +4119,14 @@ def page_html(
               <div class="small muted">
                 中文名、常见译名和轻微误差先由本地模型理解；只有通过
                 NAID character exact-match 的 Danbooru tag 才会自动写入。
+                “优先角色原设”会清除原图中的发色、瞳色、发型、服装与佩饰
+                tags，但保留动作、构图、背景、光照和画风。
               </div>
+
+              <label class="checkbox-inline small muted" style="margin-top:6px">
+                <input id="character-force-refresh" type="checkbox">
+                忽略本地人物缓存，重新解析
+              </label>
             </div>
 
             <hr
@@ -4303,7 +4388,7 @@ def page_html(
 <header>
   <div class="header-inner">
     <div>
-      <h1>Illustrious Reconstruction Studio v2.3</h1>
+      <h1>Illustrious Reconstruction Studio v2.3.1</h1>
       <div class="header-sub">
         Analyze · Correct · Generate · Compare · Learn
       </div>
@@ -4543,9 +4628,17 @@ function refreshPromptPreview() {{
 function clearCharacterResolution() {{
   const tag = document.getElementById('resolved-character-tag');
   const remove = document.getElementById('character-remove-tags');
+  const identityRemove = document.getElementById(
+    'character-identity-remove-tags'
+  );
+  const appearanceRemove = document.getElementById(
+    'character-appearance-remove-tags'
+  );
   const note = document.getElementById('character-note');
   if (tag) tag.value = '';
   if (remove) remove.value = '';
+  if (identityRemove) identityRemove.value = '';
+  if (appearanceRemove) appearanceRemove.value = '';
   if (note) note.textContent = '';
   refreshPromptPreview();
 }}
@@ -4554,8 +4647,16 @@ async function resolveCharacter() {{
   const query = document.getElementById('character-query');
   const base = document.getElementById('base-prompt');
   const model = document.getElementById('correction-model');
+  const mode = document.getElementById('character-mode');
+  const forceRefresh = document.getElementById('character-force-refresh');
   const tag = document.getElementById('resolved-character-tag');
   const remove = document.getElementById('character-remove-tags');
+  const identityRemove = document.getElementById(
+    'character-identity-remove-tags'
+  );
+  const appearanceRemove = document.getElementById(
+    'character-appearance-remove-tags'
+  );
   const note = document.getElementById('character-note');
   const button = document.getElementById('character-resolve-button');
 
@@ -4566,6 +4667,8 @@ async function resolveCharacter() {{
 
   tag.value = '';
   remove.value = '';
+  identityRemove.value = '';
+  appearanceRemove.value = '';
   note.textContent = '正在用本地模型解析，并核验 Danbooru character tag…';
   button.disabled = true;
 
@@ -4576,7 +4679,9 @@ async function resolveCharacter() {{
       body: JSON.stringify({{
         query: query.value,
         base_prompt: base ? base.value : '',
-        model: model ? model.value : ''
+        model: model ? model.value : '',
+        mode: mode ? mode.value : 'identity_only',
+        force_refresh: forceRefresh ? forceRefresh.checked : false
       }})
     }});
     const data = await response.json();
@@ -4585,11 +4690,23 @@ async function resolveCharacter() {{
     }}
 
     tag.value = data.resolved_tag || '';
-    remove.value = (data.remove_tags || []).join(', ');
-    const removed = (data.remove_tags || []).length
-      ? '；替换原人物：' + data.remove_tags.join(', ')
-      : '；未发现需要移除的原人物 tag';
-    note.textContent = '已验证：' + data.resolved_tag + removed;
+    const identityTags = data.identity_remove_tags || [];
+    const appearanceTags = data.appearance_remove_tags || [];
+    identityRemove.value = identityTags.join(', ');
+    appearanceRemove.value = appearanceTags.join(', ');
+    remove.value = identityTags.concat(appearanceTags).join(', ');
+
+    const details = [];
+    if (identityTags.length) {{
+      details.push('替换原人物：' + identityTags.join(', '));
+    }}
+    if (appearanceTags.length) {{
+      details.push('移除原图外观约束：' + appearanceTags.join(', '));
+    }}
+    if (!details.length) details.push('没有需要移除的冲突 tag');
+    const cacheText = data.cache_hit ? '（已使用本地缓存）' : '';
+    note.textContent = '已验证：' + data.resolved_tag + cacheText
+      + '；' + details.join('；');
     refreshPromptPreview();
   }} catch (error) {{
     note.textContent = '未修改 Prompt：' + error.message;
@@ -4610,7 +4727,17 @@ function resetPromptEditor() {{
   const characterQuery = document.getElementById('character-query');
   const characterTag = document.getElementById('resolved-character-tag');
   const characterRemove = document.getElementById('character-remove-tags');
+  const characterIdentityRemove = document.getElementById(
+    'character-identity-remove-tags'
+  );
+  const characterAppearanceRemove = document.getElementById(
+    'character-appearance-remove-tags'
+  );
   const characterNote = document.getElementById('character-note');
+  const characterMode = document.getElementById('character-mode');
+  const characterForceRefresh = document.getElementById(
+    'character-force-refresh'
+  );
 
   if (instruction) instruction.value = '';
   if (add) add.value = '';
@@ -4620,7 +4747,11 @@ function resetPromptEditor() {{
   if (characterQuery) characterQuery.value = '';
   if (characterTag) characterTag.value = '';
   if (characterRemove) characterRemove.value = '';
+  if (characterIdentityRemove) characterIdentityRemove.value = '';
+  if (characterAppearanceRemove) characterAppearanceRemove.value = '';
   if (characterNote) characterNote.textContent = '';
+  if (characterMode) characterMode.value = 'identity_only';
+  if (characterForceRefresh) characterForceRefresh.checked = false;
   if (base && finalBox) finalBox.value = base.value;
 }}
 
@@ -4729,8 +4860,24 @@ function loadGenerationPrompt(prompt) {{
     'character-remove-tags'
   );
 
+  const characterIdentityRemove = document.getElementById(
+    'character-identity-remove-tags'
+  );
+
+  const characterAppearanceRemove = document.getElementById(
+    'character-appearance-remove-tags'
+  );
+
   const characterNote = document.getElementById(
     'character-note'
+  );
+
+  const characterMode = document.getElementById(
+    'character-mode'
+  );
+
+  const characterForceRefresh = document.getElementById(
+    'character-force-refresh'
   );
 
   if (base) base.value = prompt;
@@ -4742,7 +4889,11 @@ function loadGenerationPrompt(prompt) {{
   if (characterQuery) characterQuery.value = '';
   if (characterTag) characterTag.value = '';
   if (characterRemove) characterRemove.value = '';
+  if (characterIdentityRemove) characterIdentityRemove.value = '';
+  if (characterAppearanceRemove) characterAppearanceRemove.value = '';
   if (characterNote) characterNote.textContent = '';
+  if (characterMode) characterMode.value = 'identity_only';
+  if (characterForceRefresh) characterForceRefresh.checked = false;
 
   document.getElementById(
     'prompt-editor'
@@ -5383,6 +5534,18 @@ class Handler(
                             )
                         ),
                         ollama_url=OLLAMA_URL,
+                        mode=str(
+                            payload.get(
+                                "mode",
+                                "identity_only",
+                            )
+                        ),
+                        force_refresh=bool(
+                            payload.get(
+                                "force_refresh",
+                                False,
+                            )
+                        ),
                     )
                 finally:
                     CHARACTER_LOCK.release()
@@ -5839,6 +6002,24 @@ class Handler(
                             character_tag=str(
                                 character_override.get("resolved_tag", "")
                             ),
+                            character_mode=str(
+                                character_override.get(
+                                    "mode",
+                                    "identity_only",
+                                )
+                            ),
+                            character_identity_remove_tags=list(
+                                character_override.get(
+                                    "identity_remove_tags",
+                                    [],
+                                )
+                            ),
+                            character_appearance_remove_tags=list(
+                                character_override.get(
+                                    "appearance_remove_tags",
+                                    [],
+                                )
+                            ),
                             character_remove_tags=list(
                                 character_override.get("remove_tags", [])
                             ),
@@ -6096,6 +6277,24 @@ class Handler(
                         character_tag=str(
                             character_override.get("resolved_tag", "")
                         ),
+                        character_mode=str(
+                            character_override.get(
+                                "mode",
+                                "identity_only",
+                            )
+                        ),
+                        character_identity_remove_tags=list(
+                            character_override.get(
+                                "identity_remove_tags",
+                                [],
+                            )
+                        ),
+                        character_appearance_remove_tags=list(
+                            character_override.get(
+                                "appearance_remove_tags",
+                                [],
+                            )
+                        ),
                         character_remove_tags=list(
                             character_override.get("remove_tags", [])
                         ),
@@ -6241,6 +6440,23 @@ class Handler(
                         inherited_character_tag = str(
                             parent["character_tag"] or ""
                         )
+                        inherited_character_mode = str(
+                            parent["character_mode"] or "identity_only"
+                        )
+                        try:
+                            inherited_character_identity_remove_tags = json.loads(
+                                parent["character_identity_remove_tags_json"]
+                                or "[]"
+                            )
+                        except Exception:
+                            inherited_character_identity_remove_tags = []
+                        try:
+                            inherited_character_appearance_remove_tags = json.loads(
+                                parent["character_appearance_remove_tags_json"]
+                                or "[]"
+                            )
+                        except Exception:
+                            inherited_character_appearance_remove_tags = []
                         try:
                             inherited_character_remove_tags = json.loads(
                                 parent["character_remove_tags_json"] or "[]"
@@ -6309,6 +6525,9 @@ class Handler(
                     if normalize_tag_key(inherited_character_tag) not in corrected_keys:
                         inherited_character_query = ""
                         inherited_character_tag = ""
+                        inherited_character_mode = "identity_only"
+                        inherited_character_identity_remove_tags = []
+                        inherited_character_appearance_remove_tags = []
                         inherited_character_remove_tags = []
                         inherited_character_verification = {}
 
@@ -6358,6 +6577,23 @@ class Handler(
                         ),
                         character_query=inherited_character_query,
                         character_tag=inherited_character_tag,
+                        character_mode=inherited_character_mode,
+                        character_identity_remove_tags=(
+                            inherited_character_identity_remove_tags
+                            if isinstance(
+                                inherited_character_identity_remove_tags,
+                                list,
+                            )
+                            else []
+                        ),
+                        character_appearance_remove_tags=(
+                            inherited_character_appearance_remove_tags
+                            if isinstance(
+                                inherited_character_appearance_remove_tags,
+                                list,
+                            )
+                            else []
+                        ),
                         character_remove_tags=(
                             inherited_character_remove_tags
                             if isinstance(inherited_character_remove_tags, list)

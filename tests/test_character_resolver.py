@@ -20,6 +20,81 @@ def verified(tag):
 
 
 class CharacterResolverTests(unittest.TestCase):
+    def test_canonical_mode_removes_only_appearance_conflicts(self):
+        plan = {
+            "candidate_tags": ["lillie (pokemon)"],
+            "existing_character_tags": [],
+            "conflicting_appearance_tags": [
+                "brown hair",
+                "red eyes",
+                "pink dress",
+                "holding basket",
+                "forest background",
+                "closed eyes",
+                "hair pulling",
+                "painterly hair rendering",
+            ],
+        }
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch.object(character_resolver, "_model_plan", return_value=plan),
+        ):
+            result = character_resolver.resolve_character(
+                query="宝可梦 莉莉艾",
+                base_prompt=(
+                    "1girl, brown hair, red eyes, pink dress, "
+                    "holding basket, forest background, closed eyes, "
+                    "hair pulling, painterly hair rendering"
+                ),
+                mode="canonical",
+                lookup=verified,
+                cache_path=Path(temp_dir) / "characters.json",
+            )
+
+        self.assertEqual(
+            result["appearance_remove_tags"],
+            ["brown hair", "red eyes", "pink dress"],
+        )
+        self.assertNotIn("holding basket", result["remove_tags"])
+        self.assertNotIn("forest background", result["remove_tags"])
+        self.assertNotIn("closed eyes", result["remove_tags"])
+        self.assertNotIn("hair pulling", result["remove_tags"])
+        self.assertNotIn("painterly hair rendering", result["remove_tags"])
+
+    def test_identical_request_and_prompt_use_plan_cache(self):
+        plan = {
+            "candidate_tags": ["lillie (pokemon)"],
+            "existing_character_tags": [],
+            "conflicting_appearance_tags": ["brown hair"],
+            "note": "cached plan",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "characters.json"
+            with patch.object(
+                character_resolver,
+                "_model_plan",
+                return_value=plan,
+            ) as model_plan:
+                first = character_resolver.resolve_character(
+                    query="宝可梦 莉莉艾",
+                    base_prompt="1girl, brown hair",
+                    mode="canonical",
+                    lookup=verified,
+                    cache_path=cache_path,
+                )
+                second = character_resolver.resolve_character(
+                    query="神奇宝贝莉莉艾",
+                    base_prompt="1girl, brown hair",
+                    mode="canonical",
+                    lookup=verified,
+                    cache_path=cache_path,
+                )
+
+        self.assertEqual(first["resolved_tag"], "lillie (pokemon)")
+        self.assertEqual(second["cache_hit"], "plan")
+        self.assertEqual(model_plan.call_count, 1)
+
     def test_verified_character_replaces_only_verified_existing_character(self):
         plan = {
             "candidate_tags": ["lillie (pokemon)"],
@@ -43,13 +118,15 @@ class CharacterResolverTests(unittest.TestCase):
             }
 
         with patch.object(character_resolver, "_model_plan", return_value=plan):
-            result = character_resolver.resolve_character(
-                query="宝可梦 莉莉艾",
-                base_prompt=(
-                    "1girl, aerith gainsborough, brown hair, green eyes"
-                ),
-                lookup=lookup,
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = character_resolver.resolve_character(
+                    query="宝可梦 莉莉艾",
+                    base_prompt=(
+                        "1girl, aerith gainsborough, brown hair, green eyes"
+                    ),
+                    lookup=lookup,
+                    cache_path=Path(temp_dir) / "characters.json",
+                )
 
         self.assertEqual(result["resolved_tag"], "lillie (pokemon)")
         self.assertEqual(result["remove_tags"], ["aerith gainsborough"])
@@ -84,11 +161,13 @@ class CharacterResolverTests(unittest.TestCase):
                 return_value="edelgard von hresvelg",
             ),
         ):
-            result = character_resolver.resolve_character(
-                query="火焰纹章 艾黛尔贾特",
-                base_prompt="1girl",
-                lookup=lookup,
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = character_resolver.resolve_character(
+                    query="火焰纹章 艾黛尔贾特",
+                    base_prompt="1girl",
+                    lookup=lookup,
+                    cache_path=Path(temp_dir) / "characters.json",
+                )
 
         self.assertEqual(result["resolved_tag"], "edelgard von hresvelg")
         self.assertEqual(result["error"], "")
@@ -115,11 +194,13 @@ class CharacterResolverTests(unittest.TestCase):
                 return_value=[],
             ),
         ):
-            result = character_resolver.resolve_character(
-                query="测试角色",
-                base_prompt="1girl",
-                lookup=lookup,
-            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                result = character_resolver.resolve_character(
+                    query="测试角色",
+                    base_prompt="1girl",
+                    lookup=lookup,
+                    cache_path=Path(temp_dir) / "characters.json",
+                )
 
         self.assertEqual(result["resolved_tag"], "")
         self.assertEqual(result["suggested_tag"], "some character")
@@ -135,6 +216,41 @@ class CharacterResolverTests(unittest.TestCase):
                 final_prompt="1girl, blonde hair",
                 lookup=verified,
             )
+
+    def test_generation_validation_accepts_canonical_appearance_removal(self):
+        result = character_resolver.validate_character_override(
+            query="宝可梦 莉莉艾",
+            resolved_tag="lillie (pokemon)",
+            remove_tags=[],
+            appearance_remove_tags=["brown hair", "red eyes"],
+            mode="canonical",
+            base_prompt="1girl, brown hair, red eyes, forest background",
+            final_prompt="1girl, forest background, lillie (pokemon)",
+            lookup=verified,
+        )
+        self.assertEqual(
+            result["appearance_remove_tags"],
+            ["brown hair", "red eyes"],
+        )
+
+    def test_prompt_edit_keeps_scene_and_action_when_applying_character(self):
+        final_prompt = web_ui.apply_prompt_edits(
+            (
+                "1girl, aerith gainsborough, brown hair, pink dress, "
+                "holding basket, forest background, soft lighting"
+            ),
+            remove_tags_text=(
+                "aerith gainsborough, brown hair, pink dress"
+            ),
+            add_tags_text="lillie (pokemon)",
+        )
+        self.assertEqual(
+            final_prompt,
+            (
+                "1girl, holding basket, forest background, soft lighting, "
+                "lillie (pokemon)"
+            ),
+        )
 
 
 class StudioSchemaMigrationTests(unittest.TestCase):
@@ -162,6 +278,9 @@ class StudioSchemaMigrationTests(unittest.TestCase):
 
         self.assertIn("character_query", columns)
         self.assertIn("character_tag", columns)
+        self.assertIn("character_mode", columns)
+        self.assertIn("character_identity_remove_tags_json", columns)
+        self.assertIn("character_appearance_remove_tags_json", columns)
         self.assertIn("character_remove_tags_json", columns)
         self.assertIn("character_verification_json", columns)
 
@@ -196,6 +315,9 @@ class StudioSchemaMigrationTests(unittest.TestCase):
                     final_prompt="1girl, lillie (pokemon)",
                     character_query="宝可梦 莉莉艾",
                     character_tag="lillie (pokemon)",
+                    character_mode="canonical",
+                    character_identity_remove_tags=["aerith gainsborough"],
+                    character_appearance_remove_tags=["brown hair"],
                     character_remove_tags=["aerith gainsborough"],
                     character_verification={
                         "verification": verified("lillie (pokemon)")
@@ -210,6 +332,8 @@ class StudioSchemaMigrationTests(unittest.TestCase):
             conn.close()
 
             self.assertEqual(row["character_tag"], "lillie (pokemon)")
+            self.assertEqual(row["character_mode"], "canonical")
+            self.assertIn("brown hair", row["character_appearance_remove_tags_json"])
             self.assertIn("aerith gainsborough", row["character_remove_tags_json"])
 
 
