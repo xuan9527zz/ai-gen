@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.3.1
+Illustrious Reconstruction Studio v2.4.0
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
@@ -10,11 +10,12 @@ Local/LAN browser workspace for:
 5) original-vs-generated comparison + multidimensional 1-5 ratings
 6) mobile-friendly UI
 7) non-navigating long-task progress overlay with real elapsed time
+8) user-selected best candidate + source-vs-generation AI auto-improvement
 
 Expected sibling files:
     illustrious_web_ui.py
     illustrious_generate.py          # use Generator v1.1+
-    illustrious_orchestrator.py      # Analyzer v2.3.1+
+    illustrious_orchestrator.py      # Analyzer v2.5.1+
     illustrious_db.py                # DB v1.1+
     illustrious_generation_config.json
     anime.json
@@ -37,6 +38,7 @@ Security:
 
 from __future__ import annotations
 
+import base64
 import copy
 import datetime as dt
 import html
@@ -59,6 +61,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 # ============================================================
@@ -111,6 +114,7 @@ GENERATION_LOCK = threading.Lock()
 ANALYSIS_LOCK = threading.Lock()
 CORRECTION_LOCK = threading.Lock()
 CHARACTER_LOCK = threading.Lock()
+AUTO_IMPROVE_LOCK = threading.Lock()
 
 ALLOWED_IMAGE_EXTENSIONS = {
     ".jpg",
@@ -130,6 +134,11 @@ OLLAMA_URL = os.getenv(
 )
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+AUTO_IMPROVE_VLM_MODEL = os.getenv(
+    "ILLUSTRIOUS_VLM_MODEL",
+    analyzer.VLM_MODEL,
+)
 
 
 # ============================================================
@@ -595,6 +604,81 @@ CREATE TABLE IF NOT EXISTS generation_prompt_edits (
 
 CREATE INDEX IF NOT EXISTS idx_prompt_edits_parent
 ON generation_prompt_edits(parent_generation_id);
+
+CREATE TABLE IF NOT EXISTS generation_preferences (
+    analysis_run_id INTEGER PRIMARY KEY,
+    preferred_generation_id INTEGER NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY(analysis_run_id)
+        REFERENCES analysis_runs(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(preferred_generation_id)
+        REFERENCES generation_runs(id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS generation_preference_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_run_id INTEGER NOT NULL,
+    preferred_generation_id INTEGER NOT NULL,
+    previous_generation_id INTEGER,
+    note TEXT,
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY(analysis_run_id)
+        REFERENCES analysis_runs(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(preferred_generation_id)
+        REFERENCES generation_runs(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(previous_generation_id)
+        REFERENCES generation_runs(id)
+        ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_preference_events_run
+ON generation_preference_events(analysis_run_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS generation_ai_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_generation_id INTEGER NOT NULL,
+    preferred_generation_id INTEGER,
+    created_generation_id INTEGER UNIQUE,
+    status TEXT NOT NULL,
+    vlm_model TEXT NOT NULL,
+    correction_model TEXT NOT NULL,
+    comparison_image_path TEXT,
+    visual_review_json TEXT NOT NULL DEFAULT '{}',
+    prompt_plan_json TEXT NOT NULL DEFAULT '{}',
+    suggested_prompt TEXT,
+    suggested_negative_prompt TEXT,
+    recommended_config_json TEXT NOT NULL DEFAULT '{}',
+    reason_cn TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+
+    FOREIGN KEY(source_generation_id)
+        REFERENCES generation_runs(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY(preferred_generation_id)
+        REFERENCES generation_runs(id)
+        ON DELETE SET NULL,
+
+    FOREIGN KEY(created_generation_id)
+        REFERENCES generation_runs(id)
+        ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_reviews_source
+ON generation_ai_reviews(source_generation_id, id DESC);
 """
 
 
@@ -866,12 +950,26 @@ def get_generation_runs(
             pe.character_appearance_remove_tags_json,
             pe.character_remove_tags_json,
             pe.character_verification_json,
-            pe.manual_positive
+            pe.manual_positive,
+            CASE
+                WHEN gp.preferred_generation_id=g.id THEN 1
+                ELSE 0
+            END AS is_preferred,
+            gp.preferred_generation_id AS group_preferred_generation_id,
+            gp.note AS preference_note,
+            ar.source_generation_id AS ai_review_source_generation_id,
+            ar.reason_cn AS ai_review_reason,
+            ar.visual_review_json AS ai_visual_review_json,
+            ar.prompt_plan_json AS ai_prompt_plan_json
         FROM generation_runs g
         LEFT JOIN generation_ratings gr
           ON gr.generation_run_id=g.id
         LEFT JOIN generation_prompt_edits pe
           ON pe.generation_run_id=g.id
+        LEFT JOIN generation_preferences gp
+          ON gp.analysis_run_id=g.analysis_run_id
+        LEFT JOIN generation_ai_reviews ar
+          ON ar.created_generation_id=g.id
         WHERE g.analysis_run_id=?
           AND g.status='completed'
           AND g.generated_image_path IS NOT NULL
@@ -968,6 +1066,123 @@ def save_rating(
 
     finally:
         conn.close()
+
+
+def set_preferred_generation(
+    generation_run_id: int,
+    note: str = "",
+) -> Dict[str, Any]:
+    """Set the current user-selected winner while preserving preference history."""
+
+    conn = connect_db()
+
+    try:
+        generation = conn.execute(
+            """
+            SELECT id, analysis_run_id, status
+            FROM generation_runs
+            WHERE id=?
+            """,
+            (generation_run_id,),
+        ).fetchone()
+        if not generation:
+            raise ValueError("找不到这条 generation。")
+        if str(generation["status"] or "") != "completed":
+            raise ValueError("只能把已完成的候选图设为本组最佳。")
+
+        run_id = int(generation["analysis_run_id"])
+        previous = conn.execute(
+            """
+            SELECT preferred_generation_id
+            FROM generation_preferences
+            WHERE analysis_run_id=?
+            """,
+            (run_id,),
+        ).fetchone()
+        previous_id = (
+            int(previous["preferred_generation_id"])
+            if previous
+            else None
+        )
+        timestamp = now_iso()
+        clean_note = str(note or "").strip()
+
+        conn.execute(
+            """
+            INSERT INTO generation_preferences(
+                analysis_run_id,
+                preferred_generation_id,
+                note,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(analysis_run_id)
+            DO UPDATE SET
+                preferred_generation_id=excluded.preferred_generation_id,
+                note=excluded.note,
+                updated_at=excluded.updated_at
+            """,
+            (
+                run_id,
+                generation_run_id,
+                clean_note,
+                timestamp,
+                timestamp,
+            ),
+        )
+        if previous_id != generation_run_id:
+            conn.execute(
+                """
+                INSERT INTO generation_preference_events(
+                    analysis_run_id,
+                    preferred_generation_id,
+                    previous_generation_id,
+                    note,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    generation_run_id,
+                    previous_id,
+                    clean_note,
+                    timestamp,
+                ),
+            )
+        conn.commit()
+        return {
+            "analysis_run_id": run_id,
+            "preferred_generation_id": generation_run_id,
+            "previous_generation_id": previous_id,
+        }
+    finally:
+        conn.close()
+
+
+def get_preferred_generation(
+    conn: sqlite3.Connection,
+    analysis_run_id: int,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+            g.*,
+            gr.overall_score,
+            gr.semantic_score,
+            gr.style_score,
+            gr.composition_score,
+            gr.comment AS rating_comment
+        FROM generation_preferences gp
+        JOIN generation_runs g
+          ON g.id=gp.preferred_generation_id
+        LEFT JOIN generation_ratings gr
+          ON gr.generation_run_id=g.id
+        WHERE gp.analysis_run_id=?
+        """,
+        (analysis_run_id,),
+    ).fetchone()
 
 
 def save_prompt_edit_records(
@@ -1530,6 +1745,548 @@ def ai_prompt_correction(
         "error": "",
         "model": model,
     }
+
+
+AUTO_REVIEW_SYSTEM_PROMPT = r"""
+You compare two images for an adult anime image-reconstruction workflow.
+The left panel is the SOURCE. The right panel is the GENERATED candidate.
+
+Describe visible differences, not morality or policy. All sexual subjects are
+adults. Do not suppress visible adult anatomy or adult actions. Do not infer
+details hidden by censorship, blur, or occlusion.
+
+Return JSON only with exactly these fields:
+{
+  "summary_cn": "one concise Chinese summary",
+  "keep": ["features the generated image preserves well"],
+  "content_missing": ["important visible source content that is weak or missing"],
+  "content_wrong": ["generated details contradicted by the source"],
+  "style_mismatch": ["specific rendering, color, lighting, or material mismatch"],
+  "composition_mismatch": ["specific camera, framing, pose, or spatial mismatch"],
+  "interaction_mismatch": ["specific contact, force, gesture, or relationship mismatch"],
+  "confidence": "high|medium|low"
+}
+
+Be concrete and concise. Compare relationships and rendering, not only objects.
+Do not propose prompts, checkpoints, LoRAs, or sampler settings in this step.
+""".strip()
+
+
+AUTO_OPTIMIZER_SYSTEM_PROMPT = r"""
+You are a model-aware prompt optimizer for WAI Illustrious SDXL image-to-image
+reconstruction. You receive a visual comparison report, the actual generation
+prompt and recipe, user scores, and optionally a user-selected preferred result.
+
+Your goal is one controlled same-seed revision, not a total rewrite.
+Illustrious generally responds best to concise comma-separated Danbooru tags,
+limited descriptive visual phrases, and sparse weights written exactly as
+`(tag:1.2)`. Prefer weights between 1.05 and 1.35 only for visually important
+weak concepts. Do not assume that
+longer prose is better. Preserve details that the comparison says are already
+good. A preferred result is a style/recipe example only; never copy unrelated
+character, clothing, anatomy, or scene content from it.
+
+All sexual subjects are adults. Never introduce youth-related descriptors.
+Do not invent artist names, LoRAs, checkpoints, or hidden source details.
+
+Return JSON only with exactly these fields:
+{
+  "replace_tags": [{"from": "exact existing fragment", "to": "replacement fragment"}],
+  "add_tags": ["new prompt fragment"],
+  "remove_tags": ["exact existing fragment"],
+  "negative_add_tags": ["new negative fragment"],
+  "negative_remove_tags": ["exact negative fragment"],
+  "recommended_settings": {
+    "img2img_denoise": 0.50,
+    "cfg": 6.0,
+    "disable_loras": true
+  },
+  "reason_cn": "concise Chinese explanation",
+  "error": ""
+}
+
+Limits: at most 8 replacements, 12 additions, 8 removals, and 8 negative
+changes. Recommend denoise only between 0.35 and 0.75 and CFG only between 4.5
+and 8.0. If no parameter change is justified, repeat the current value. Use
+disable_loras=false unless the comparison or preferred recipe supports it.
+""".strip()
+
+
+def _comparison_panel(
+    image: Image.Image,
+    *,
+    width: int = 560,
+    height: int = 760,
+) -> Image.Image:
+    normalized = ImageOps.exif_transpose(image).convert("RGB")
+    fitted = ImageOps.contain(
+        normalized,
+        (width, height),
+        Image.Resampling.LANCZOS,
+    )
+    panel = Image.new("RGB", (width, height), (22, 25, 31))
+    panel.paste(
+        fitted,
+        (
+            (width - fitted.width) // 2,
+            (height - fitted.height) // 2,
+        ),
+    )
+    return panel
+
+
+def build_generation_comparison_image(
+    source_path: Path,
+    generated_path: Path,
+    generation_id: int,
+) -> Tuple[Path, str]:
+    """Create one labeled image so the local VLM can compare both panels."""
+
+    review_dir = RUNS_DIR / "ai_reviews"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    target = review_dir / f"generation_{int(generation_id):06d}_comparison.jpg"
+
+    with Image.open(source_path) as source_image, Image.open(
+        generated_path
+    ) as generated_image:
+        left = _comparison_panel(source_image)
+        right = _comparison_panel(generated_image)
+
+    margin = 16
+    header = 48
+    canvas = Image.new(
+        "RGB",
+        (left.width + right.width + margin * 3, left.height + header + margin * 2),
+        (13, 16, 21),
+    )
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default(size=22)
+    left_x = margin
+    right_x = margin * 2 + left.width
+    draw.text((left_x, 15), "SOURCE", fill=(240, 244, 252), font=font)
+    draw.text(
+        (right_x, 15),
+        f"GENERATED #{int(generation_id)}",
+        fill=(240, 244, 252),
+        font=font,
+    )
+    canvas.paste(left, (left_x, header + margin))
+    canvas.paste(right, (right_x, header + margin))
+    canvas.save(target, format="JPEG", quality=92, optimize=True)
+    encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+    return target, encoded
+
+
+def run_generation_visual_review(
+    comparison_image_b64: str,
+    *,
+    model: str = AUTO_IMPROVE_VLM_MODEL,
+) -> Dict[str, Any]:
+    payload = {
+        "model": str(model or AUTO_IMPROVE_VLM_MODEL),
+        "stream": False,
+        "format": "json",
+        "think": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": AUTO_REVIEW_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Compare the labeled SOURCE and GENERATED panels. "
+                    "Return the requested JSON diagnosis."
+                ),
+                "images": [comparison_image_b64],
+            },
+        ],
+        "options": {
+            "num_ctx": int(getattr(analyzer, "VLM_CONTEXT", 16384)),
+            "num_predict": 1400,
+            "temperature": 0.1,
+            "top_p": 0.9,
+        },
+        "keep_alive": 0,
+    }
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        timeout=1200,
+    )
+    response.raise_for_status()
+    content = str(response.json().get("message", {}).get("content", ""))
+    review = parse_json_object_from_text(content)
+    if not any(
+        review.get(key)
+        for key in (
+            "summary_cn",
+            "content_missing",
+            "style_mismatch",
+            "composition_mismatch",
+            "interaction_mismatch",
+        )
+    ):
+        raise ValueError("VLM 没有返回有效的图像差异报告。")
+    return review
+
+
+def generation_recipe_for_ai(generation: sqlite3.Row) -> Dict[str, Any]:
+    try:
+        sampling = json.loads(str(generation["sampling_json"] or "{}"))
+    except Exception:
+        sampling = {}
+    if not isinstance(sampling, dict):
+        sampling = {}
+    return {
+        "seed": int(generation["seed"]),
+        "checkpoint": str(generation["base_checkpoint"] or ""),
+        "loras": json.loads(str(generation["loras_json"] or "[]")),
+        "sampling": {
+            key: sampling.get(key)
+            for key in ("mode", "img2img", "base", "preset", "generation_mode")
+            if key in sampling
+        },
+    }
+
+
+def normalize_ai_replacements(value: Any) -> List[Dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for raw in value[:8]:
+        if not isinstance(raw, dict):
+            continue
+        old = " ".join(str(raw.get("from", "")).strip().split())
+        new = canonicalize_weighted_fragment(
+            " ".join(str(raw.get("to", "")).strip().split())
+        )
+        if old and new and "," not in old and "," not in new:
+            out.append({"from": old, "to": new})
+    return out
+
+
+WEIGHTED_FRAGMENT_RE = re.compile(
+    r"^\(?\s*(.+?)\s*:\s*(0?(?:\.\d+)|[1-9]\d*(?:\.\d+)?)\s*\)?$"
+)
+
+
+def canonicalize_weighted_fragment(fragment: str) -> str:
+    """Turn `tag:1.2` into valid `(tag:1.2)` emphasis syntax."""
+
+    value = " ".join(str(fragment or "").strip().split())
+    match = WEIGHTED_FRAGMENT_RE.match(value)
+    if not match:
+        return value
+    tag = match.group(1).strip(" ()")
+    weight = match.group(2)
+    if not tag:
+        return value
+    return f"({tag}:{weight})"
+
+
+def prompt_semantic_key(fragment: str) -> str:
+    """Match weighted and unweighted forms of the same prompt concept."""
+
+    value = " ".join(str(fragment or "").strip().split())
+    match = WEIGHTED_FRAGMENT_RE.match(value)
+    if match:
+        value = match.group(1)
+    return normalize_tag_key(value.strip(" ()"))
+
+
+def json_list_or_empty(value: Any) -> List[Any]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except Exception:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def json_object_or_empty(value: Any) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def run_prompt_optimizer(
+    *,
+    generation: sqlite3.Row,
+    visual_review: Dict[str, Any],
+    preferred: Optional[sqlite3.Row],
+    rating: Optional[sqlite3.Row],
+    model: str,
+) -> Dict[str, Any]:
+    preferred_context: Optional[Dict[str, Any]] = None
+    if preferred:
+        preferred_context = {
+            "generation_id": int(preferred["id"]),
+            "prompt": str(preferred["prompt"] or ""),
+            "negative_prompt": str(preferred["negative_prompt"] or ""),
+            "recipe": generation_recipe_for_ai(preferred),
+            "rating": {
+                "overall": preferred["overall_score"],
+                "content": preferred["semantic_score"],
+                "style": preferred["style_score"],
+                "composition": preferred["composition_score"],
+                "comment": str(preferred["rating_comment"] or ""),
+            },
+        }
+
+    current_rating = None
+    if rating:
+        current_rating = {
+            "overall": rating["overall_score"],
+            "content": rating["semantic_score"],
+            "style": rating["style_score"],
+            "composition": rating["composition_score"],
+            "comment": str(rating["comment"] or ""),
+        }
+
+    optimizer_input = {
+        "current_generation_id": int(generation["id"]),
+        "current_prompt": str(generation["prompt"] or ""),
+        "current_negative_prompt": str(generation["negative_prompt"] or ""),
+        "current_recipe": generation_recipe_for_ai(generation),
+        "current_user_rating": current_rating,
+        "visual_comparison": visual_review,
+        "user_selected_preferred_result": preferred_context,
+    }
+    payload = {
+        "model": str(model or DEFAULT_CORRECTION_MODEL),
+        "stream": False,
+        "format": "json",
+        "messages": [
+            {"role": "system", "content": AUTO_OPTIMIZER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(optimizer_input, ensure_ascii=False),
+            },
+        ],
+        "options": {"temperature": 0.1, "num_ctx": 16384},
+        "keep_alive": 0,
+    }
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json=payload,
+        timeout=300,
+    )
+    response.raise_for_status()
+    content = str(response.json().get("message", {}).get("content", ""))
+    parsed = parse_json_object_from_text(content)
+    return {
+        "replace_tags": normalize_ai_replacements(parsed.get("replace_tags"))[:8],
+        "add_tags": [
+            canonicalize_weighted_fragment(item)
+            for item in normalize_ai_tag_list(parsed.get("add_tags"))[:12]
+        ],
+        "remove_tags": normalize_ai_tag_list(parsed.get("remove_tags"))[:8],
+        "negative_add_tags": normalize_ai_tag_list(
+            parsed.get("negative_add_tags")
+        )[:8],
+        "negative_remove_tags": normalize_ai_tag_list(
+            parsed.get("negative_remove_tags")
+        )[:8],
+        "recommended_settings": (
+            parsed.get("recommended_settings")
+            if isinstance(parsed.get("recommended_settings"), dict)
+            else {}
+        ),
+        "reason_cn": str(parsed.get("reason_cn", "") or "").strip(),
+        "error": str(parsed.get("error", "") or "").strip(),
+        "model": str(model or DEFAULT_CORRECTION_MODEL),
+    }
+
+
+def apply_optimizer_prompt_plan(
+    base_prompt: str,
+    plan: Dict[str, Any],
+) -> str:
+    replacements = {
+        prompt_semantic_key(item["from"]): canonicalize_weighted_fragment(
+            item["to"]
+        )
+        for item in plan.get("replace_tags", [])
+        if isinstance(item, dict) and item.get("from") and item.get("to")
+    }
+    remove = {
+        prompt_semantic_key(item)
+        for item in plan.get("remove_tags", [])
+        if prompt_semantic_key(item)
+    }
+    result: List[str] = []
+    for fragment in split_prompt_fragments(base_prompt):
+        key = prompt_semantic_key(fragment)
+        if key in remove:
+            continue
+        result.append(replacements.get(key, fragment))
+
+    # A weighted addition upgrades an existing unweighted concept instead of
+    # leaving two competing forms such as `spread anus` and
+    # `(spread anus:1.25)` in the same prompt.
+    for raw in plan.get("add_tags", []):
+        addition = canonicalize_weighted_fragment(raw)
+        addition_key = prompt_semantic_key(addition)
+        existing_index = next(
+            (
+                index
+                for index, item in enumerate(result)
+                if prompt_semantic_key(item) == addition_key
+            ),
+            None,
+        )
+        if existing_index is None:
+            result.append(addition)
+        elif WEIGHTED_FRAGMENT_RE.match(addition):
+            result[existing_index] = addition
+    final = ", ".join(dedupe_prompt_fragments(result))
+    if not final:
+        raise ValueError("AI 优化方案会产生空 Prompt，已停止生成。")
+    return final
+
+
+def apply_optimizer_negative_plan(
+    base_negative: str,
+    plan: Dict[str, Any],
+) -> str:
+    return apply_prompt_edits(
+        base_negative,
+        remove_tags_text=", ".join(plan.get("negative_remove_tags", [])),
+        add_tags_text=", ".join(plan.get("negative_add_tags", [])),
+    )
+
+
+def apply_optimizer_settings(
+    cfg: Dict[str, Any],
+    plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    value = copy.deepcopy(cfg)
+    settings = plan.get("recommended_settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+
+    img2img = value.get("img2img")
+    if isinstance(img2img, dict) and bool(img2img.get("enabled")):
+        try:
+            denoise = float(settings.get("img2img_denoise"))
+        except (TypeError, ValueError):
+            denoise = float(
+                img2img.get("denoise", generator.DEFAULT_IMG2IMG_DENOISE)
+            )
+        img2img["denoise"] = min(
+            generator.MAX_UI_IMG2IMG_DENOISE,
+            max(generator.MIN_UI_IMG2IMG_DENOISE, denoise),
+        )
+
+    try:
+        cfg_value = float(settings.get("cfg"))
+    except (TypeError, ValueError):
+        cfg_value = float(
+            value.get("sampling_overrides", {}).get("base", {}).get("cfg", 6.0)
+        )
+    cfg_value = min(8.0, max(4.5, cfg_value))
+    value.setdefault("sampling_overrides", {}).setdefault("base", {})[
+        "cfg"
+    ] = cfg_value
+
+    if settings.get("disable_loras") is True:
+        for slot in value.get("lora_slots", []):
+            if isinstance(slot, dict):
+                slot["enabled"] = False
+
+    value["generation_mode"] = {
+        "id": "ai_auto_improve",
+        "label": "AI 对比改进",
+        "description": "VLM 对比原图与候选图后，同 seed 生成一张受控改进版。",
+    }
+    value["diagnostic"] = {
+        "suite": "ai_auto_review_v1",
+        "variant": "AI",
+        "label": "AI source-vs-generation review",
+    }
+    return value
+
+
+def create_ai_review_row(
+    *,
+    source_generation_id: int,
+    preferred_generation_id: Optional[int],
+    vlm_model: str,
+    correction_model: str,
+) -> int:
+    conn = connect_db()
+    try:
+        review_id = conn.execute(
+            """
+            INSERT INTO generation_ai_reviews(
+                source_generation_id,
+                preferred_generation_id,
+                status,
+                vlm_model,
+                correction_model,
+                created_at
+            )
+            VALUES (?, ?, 'running', ?, ?, ?)
+            """,
+            (
+                source_generation_id,
+                preferred_generation_id,
+                vlm_model,
+                correction_model,
+                now_iso(),
+            ),
+        ).lastrowid
+        conn.commit()
+        return int(review_id)
+    finally:
+        conn.close()
+
+
+def finish_ai_review_row(
+    review_id: int,
+    *,
+    status: str,
+    comparison_image_path: Optional[Path] = None,
+    visual_review: Optional[Dict[str, Any]] = None,
+    prompt_plan: Optional[Dict[str, Any]] = None,
+    suggested_prompt: str = "",
+    suggested_negative_prompt: str = "",
+    recommended_config: Optional[Dict[str, Any]] = None,
+    created_generation_id: Optional[int] = None,
+    reason_cn: str = "",
+    error: str = "",
+) -> None:
+    conn = connect_db()
+    try:
+        conn.execute(
+            """
+            UPDATE generation_ai_reviews
+            SET status=?, comparison_image_path=?, visual_review_json=?,
+                prompt_plan_json=?, suggested_prompt=?, suggested_negative_prompt=?,
+                recommended_config_json=?, created_generation_id=?, reason_cn=?,
+                error=?, finished_at=?
+            WHERE id=?
+            """,
+            (
+                status,
+                str(comparison_image_path) if comparison_image_path else None,
+                json.dumps(visual_review or {}, ensure_ascii=False),
+                json.dumps(prompt_plan or {}, ensure_ascii=False),
+                suggested_prompt,
+                suggested_negative_prompt,
+                json.dumps(recommended_config or {}, ensure_ascii=False),
+                created_generation_id,
+                reason_cn,
+                error,
+                now_iso(),
+                review_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def character_override_from_form(
@@ -3914,6 +4671,33 @@ def page_html(
             else ""
         )
 
+        if bool(row["is_preferred"]):
+            preference_control = (
+                "<div class='small status-good' style='margin-top:7px'>"
+                "★ 当前用户基准（本组最佳）"
+                "</div>"
+            )
+        else:
+            preference_control = f"""
+            <form method="post" action="/prefer" style="margin-top:7px">
+              <input type="hidden" name="run_id" value="{int(selected_run_id)}">
+              <input type="hidden" name="generation_id" value="{gid}">
+              <button type="submit" class="secondary">设为本组最佳</button>
+            </form>
+            """
+
+        ai_review_badge = ""
+        if row["ai_review_reason"]:
+            source_id = row["ai_review_source_generation_id"]
+            ai_review_badge = f"""
+            <details style="margin-top:7px">
+              <summary>AI 自动复盘（来自 #{esc(source_id)}）</summary>
+              <div class="small status-good" style="margin-top:6px">
+                {esc(row['ai_review_reason'])}
+              </div>
+            </details>
+            """
+
         candidate_cards.append(
             f"""
             <div class="candidate">
@@ -3937,6 +4721,8 @@ def page_html(
                 {preset_badge}
                 {correction_badge}
                 {character_badge}
+                {preference_control}
+                {ai_review_badge}
 
                 <details style="margin-top:7px">
                   <summary>实际生成 Prompt</summary>
@@ -3999,6 +4785,33 @@ def page_html(
               </div>
 
               <div class="correction-area">
+                <form
+                  method="post"
+                  action="/auto-improve"
+                  onsubmit="
+                    return submitWithProgress(
+                      event,
+                      this,
+                      'AI 正在对比原图与候选图，然后同 seed 生成改进版…'
+                    )
+                  "
+                >
+                  <input type="hidden" name="generation_id" value="{gid}">
+                  <input
+                    type="hidden"
+                    name="correction_model"
+                    value="{esc(correction_model)}"
+                  >
+                  <button type="submit">
+                    AI 对比原图 → 同 seed 改进 1 张
+                  </button>
+                  <div class="small muted" style="margin-top:6px">
+                    会读取原图、当前结果、评分、生成参数和你选中的本组最佳。
+                  </div>
+                </form>
+
+                <hr style="margin:14px 0; border-color:var(--border)">
+
                 <form
                   method="post"
                   action="/correct-and-generate"
@@ -4590,7 +5403,7 @@ def page_html(
 <header>
   <div class="header-inner">
     <div>
-      <h1>Illustrious Reconstruction Studio v2.3.1</h1>
+      <h1>Illustrious Reconstruction Studio v2.4.0</h1>
       <div class="header-sub">
         Analyze · Correct · Generate · Compare · Learn
       </div>
@@ -5157,6 +5970,9 @@ function operationProgressText(action, fallbackText) {{
   }}
   if (path === '/correct-and-generate') {{
     return '正在修改 Prompt，并生成新的候选图…';
+  }}
+  if (path === '/auto-improve') {{
+    return 'AI 正在对比原图与候选图，整理 Prompt，并同 seed 生成改进版…';
   }}
   if (path === '/generate') {{
     return '正在生图：ComfyUI 正在处理候选图…';
@@ -6023,6 +6839,287 @@ class Handler(
 
         # Remaining POST routes are urlencoded.
         form = self.parse_urlencoded_form()
+
+        # ----------------------------------------------------
+        # User-selected best candidate (personal preference)
+        # ----------------------------------------------------
+
+        if parsed.path == "/prefer":
+            run_id = int(first_value(form, "run_id"))
+            generation_id = int(first_value(form, "generation_id"))
+            try:
+                result = set_preferred_generation(
+                    generation_id,
+                    note="用户在 Studio 中设为本组最佳。",
+                )
+                actual_run_id = int(result["analysis_run_id"])
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": actual_run_id,
+                        "message": (
+                            f"Generation #{generation_id} 已设为本组最佳，"
+                            "后续 AI 复盘会把它作为个人偏好参考。"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": run_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            return
+
+        # ----------------------------------------------------
+        # Compare source/candidate, optimize prompt, same-seed regenerate
+        # ----------------------------------------------------
+
+        if parsed.path == "/auto-improve":
+            generation_id = int(first_value(form, "generation_id"))
+            model = first_value(
+                form,
+                "correction_model",
+                DEFAULT_CORRECTION_MODEL,
+            ).strip()
+            run_id: Optional[int] = None
+            review_id: Optional[int] = None
+            acquired_generation = False
+            acquired_auto = False
+
+            try:
+                if not AUTO_IMPROVE_LOCK.acquire(blocking=False):
+                    raise RuntimeError("已有 AI 自动复盘任务正在运行。")
+                acquired_auto = True
+                try:
+                    if not GENERATION_LOCK.acquire(blocking=False):
+                        raise RuntimeError("已有生成任务正在运行。")
+                    acquired_generation = True
+
+                    conn = connect_db()
+                    try:
+                        parent = get_generation_run(conn, generation_id)
+                        if not parent:
+                            raise ValueError("找不到这条 generation。")
+                        if str(parent["status"] or "") != "completed":
+                            raise ValueError("只能复盘已完成的候选图。")
+                        run_id = int(parent["analysis_run_id"])
+                        analysis = get_analysis_run(conn, run_id)
+                        if not analysis:
+                            raise ValueError("找不到对应的 Analysis Run。")
+                        preferred = get_preferred_generation(conn, run_id)
+                        rating = conn.execute(
+                            """
+                            SELECT * FROM generation_ratings
+                            WHERE generation_run_id=?
+                            """,
+                            (generation_id,),
+                        ).fetchone()
+                    finally:
+                        conn.close()
+
+                    source_path = Path(str(analysis["first_seen_path"] or ""))
+                    generated_path = Path(
+                        str(parent["generated_image_path"] or "")
+                    )
+                    if not source_path.is_file():
+                        raise FileNotFoundError("找不到当前 Analysis Run 的原图。")
+                    if not generated_path.is_file():
+                        raise FileNotFoundError("找不到当前候选图文件。")
+
+                    preferred_id = int(preferred["id"]) if preferred else None
+                    review_id = create_ai_review_row(
+                        source_generation_id=generation_id,
+                        preferred_generation_id=preferred_id,
+                        vlm_model=AUTO_IMPROVE_VLM_MODEL,
+                        correction_model=model,
+                    )
+                    comparison_path, comparison_b64 = (
+                        build_generation_comparison_image(
+                            source_path,
+                            generated_path,
+                            generation_id,
+                        )
+                    )
+                    visual_review = run_generation_visual_review(
+                        comparison_b64,
+                        model=AUTO_IMPROVE_VLM_MODEL,
+                    )
+                    plan = run_prompt_optimizer(
+                        generation=parent,
+                        visual_review=visual_review,
+                        preferred=preferred,
+                        rating=rating,
+                        model=model,
+                    )
+                    if plan["error"]:
+                        raise ValueError(plan["error"])
+
+                    optimized_prompt = apply_optimizer_prompt_plan(
+                        str(parent["prompt"] or ""),
+                        plan,
+                    )
+                    optimized_negative = apply_optimizer_negative_plan(
+                        str(parent["negative_prompt"] or ""),
+                        plan,
+                    )
+                    cfg = apply_optimizer_settings(
+                        config_from_generation(parent),
+                        plan,
+                    )
+                    cfg["negative_prompt"] = optimized_negative
+
+                    results = generator.generate_candidates(
+                        run_id=run_id,
+                        count=1,
+                        cfg=cfg,
+                        prompt_override=optimized_prompt,
+                        seeds_override=[int(parent["seed"])],
+                    )
+                    if not results:
+                        raise RuntimeError("ComfyUI 没有生成新的候选图。")
+                    new_generation_id = int(results[0]["generation_id"])
+
+                    inherited_character_tag = str(parent["character_tag"] or "")
+                    final_keys = {
+                        normalize_tag_key(item)
+                        for item in split_prompt_fragments(optimized_prompt)
+                    }
+                    keep_character = (
+                        bool(inherited_character_tag)
+                        and normalize_tag_key(inherited_character_tag) in final_keys
+                    )
+                    reason = plan["reason_cn"] or str(
+                        visual_review.get("summary_cn", "AI 已完成图像差异复盘。")
+                    )
+                    replacement_adds = [
+                        item["to"] for item in plan["replace_tags"]
+                    ]
+                    replacement_removes = [
+                        item["from"] for item in plan["replace_tags"]
+                    ]
+                    save_prompt_edit_records(
+                        results,
+                        parent_generation_id=generation_id,
+                        edit_kind="ai_visual_revision",
+                        base_prompt=str(parent["prompt"] or ""),
+                        user_instruction=f"AI 自动对比原图后改进：{reason}",
+                        correction_model=model,
+                        ai_add_tags=dedupe_prompt_fragments(
+                            replacement_adds + plan["add_tags"]
+                        ),
+                        ai_remove_tags=dedupe_prompt_fragments(
+                            replacement_removes + plan["remove_tags"]
+                        ),
+                        manual_positive="",
+                        final_prompt=optimized_prompt,
+                        character_query=(
+                            str(parent["character_query"] or "")
+                            if keep_character
+                            else ""
+                        ),
+                        character_tag=(inherited_character_tag if keep_character else ""),
+                        character_mode=(
+                            str(parent["character_mode"] or "identity_only")
+                            if keep_character
+                            else "identity_only"
+                        ),
+                        character_identity_remove_tags=(
+                            json_list_or_empty(
+                                parent["character_identity_remove_tags_json"]
+                            )
+                            if keep_character
+                            else []
+                        ),
+                        character_appearance_remove_tags=(
+                            json_list_or_empty(
+                                parent["character_appearance_remove_tags_json"]
+                            )
+                            if keep_character
+                            else []
+                        ),
+                        character_remove_tags=(
+                            json_list_or_empty(parent["character_remove_tags_json"])
+                            if keep_character
+                            else []
+                        ),
+                        character_verification=(
+                            json_object_or_empty(
+                                parent["character_verification_json"]
+                            )
+                            if keep_character
+                            else {}
+                        ),
+                    )
+
+                    effective_config = {
+                        "requested": plan.get("recommended_settings", {}),
+                        "img2img": cfg.get("img2img", {}),
+                        "base_sampling": cfg.get("sampling_overrides", {}).get(
+                            "base", {}
+                        ),
+                        "loras": cfg.get("lora_slots", []),
+                        "seed": int(parent["seed"]),
+                    }
+                    finish_ai_review_row(
+                        review_id,
+                        status="completed",
+                        comparison_image_path=comparison_path,
+                        visual_review=visual_review,
+                        prompt_plan=plan,
+                        suggested_prompt=optimized_prompt,
+                        suggested_negative_prompt=optimized_negative,
+                        recommended_config=effective_config,
+                        created_generation_id=new_generation_id,
+                        reason_cn=reason,
+                    )
+
+                    state = load_ui_state(load_base_config())
+                    state["last_run_id"] = run_id
+                    save_ui_state(state)
+                finally:
+                    if acquired_generation:
+                        GENERATION_LOCK.release()
+                        acquired_generation = False
+                    if acquired_auto:
+                        AUTO_IMPROVE_LOCK.release()
+                        acquired_auto = False
+
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": run_id,
+                        "message": (
+                            f"AI 已对比原图与 Generation #{generation_id}，"
+                            f"并使用同 seed 生成 #{new_generation_id}。"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                if review_id is not None:
+                    try:
+                        finish_ai_review_row(
+                            review_id,
+                            status="failed",
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    except Exception:
+                        traceback.print_exc()
+                if acquired_generation:
+                    GENERATION_LOCK.release()
+                if acquired_auto:
+                    AUTO_IMPROVE_LOCK.release()
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": run_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            return
 
         # ----------------------------------------------------
         # Re-analyze current original
