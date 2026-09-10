@@ -32,10 +32,13 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-ADAPTER_VERSION = "1.0"
+ADAPTER_VERSION = "1.1"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_JP_MAPPING = PROJECT_ROOT / "config" / "jp_to_danbooru_tags.json"
+DEFAULT_USER_JP_MAPPING = (
+    PROJECT_ROOT / "data" / "pixiv_tag_overrides.json"
+)
 
 BULLET_RE = re.compile(r"^\s*[-*•·]\s*")
 COUNT_SUFFIX_RE = re.compile(
@@ -248,14 +251,7 @@ def parse_danbooru_tags(
     )
 
 
-def load_jp_mapping(
-    mapping_path: Optional[str | Path] = None,
-) -> Dict[str, Any]:
-    path = Path(
-        mapping_path
-        or DEFAULT_JP_MAPPING
-    )
-
+def _read_mapping_file(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
 
@@ -277,6 +273,51 @@ def load_jp_mapping(
 
     except Exception:
         return {}
+
+
+def load_jp_mapping(
+    mapping_path: Optional[str | Path] = None,
+    user_mapping_path: Optional[str | Path] = None,
+) -> Dict[str, Any]:
+    """Load the public mapping plus local user-confirmed overrides."""
+    mapping = _read_mapping_file(
+        Path(mapping_path or DEFAULT_JP_MAPPING)
+    )
+    user_mapping = _read_mapping_file(
+        Path(user_mapping_path or DEFAULT_USER_JP_MAPPING)
+    )
+    mapping.update(user_mapping)
+    return mapping
+
+
+def save_pixiv_user_mapping(
+    source_tag: str,
+    mapped_prompt: str,
+    *,
+    user_mapping_path: Optional[str | Path] = None,
+) -> List[str]:
+    """Persist one user-confirmed Pixiv tag mapping in the local data folder."""
+    source_tag = str(source_tag or "").strip().lstrip("#").strip()
+    if not source_tag:
+        raise ValueError("Pixiv 原始 tag 不能为空。")
+
+    mapped_tags = dedupe_keep_order(
+        re.split(r"[,，\n]+", str(mapped_prompt or ""))
+    )
+    if not mapped_tags:
+        raise ValueError("转换后的 Prompt 至少需要一个 tag。")
+
+    path = Path(user_mapping_path or DEFAULT_USER_JP_MAPPING)
+    mapping = _read_mapping_file(path)
+    mapping[source_tag] = mapped_tags
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+    return mapped_tags
 
 
 def _split_pixiv_tags(
@@ -314,10 +355,15 @@ def _split_pixiv_tags(
 def parse_pixiv_tags(
     text: str,
     mapping_path: Optional[str | Path] = None,
+    user_mapping_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
-    mapping = load_jp_mapping(
-        mapping_path
+    public_mapping = _read_mapping_file(
+        Path(mapping_path or DEFAULT_JP_MAPPING)
     )
+    user_mapping = _read_mapping_file(
+        Path(user_mapping_path or DEFAULT_USER_JP_MAPPING)
+    )
+    mapping = {**public_mapping, **user_mapping}
 
     raw_tags = _split_pixiv_tags(
         text
@@ -325,6 +371,7 @@ def parse_pixiv_tags(
 
     normalized: List[str] = []
     unknown: List[str] = []
+    mapping_records: List[Dict[str, Any]] = []
 
     for raw in raw_tags:
         key = raw.strip()
@@ -354,14 +401,28 @@ def parse_pixiv_tags(
             mapped,
             list,
         ):
+            mapped_tags: List[str] = []
             for tag in mapped:
                 if isinstance(
                     tag,
                     str,
                 ):
-                    normalized.append(
-                        tag
-                    )
+                    normalized_tag = normalize_tag(tag)
+                    if normalized_tag:
+                        normalized.append(normalized_tag)
+                        mapped_tags.append(normalized_tag)
+
+            mapping_records.append(
+                {
+                    "source_tag": key,
+                    "mapped_tags": dedupe_keep_order(mapped_tags),
+                    "mapping_source": (
+                        "user_confirmed"
+                        if key in user_mapping
+                        else "public_mapping"
+                    ),
+                }
+            )
 
     return {
         "source_tags_raw_list": (
@@ -377,6 +438,7 @@ def parse_pixiv_tags(
                 unknown
             )
         ),
+        "mapping_records": mapping_records,
     }
 
 
@@ -384,6 +446,7 @@ def adapt_source_tags(
     source_type: str,
     source_text: str = "",
     mapping_path: Optional[str | Path] = None,
+    user_mapping_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     source_type = str(
         source_type
@@ -440,6 +503,9 @@ def adapt_source_tags(
             source_text,
             mapping_path=(
                 mapping_path
+            ),
+            user_mapping_path=(
+                user_mapping_path
             ),
         )
 

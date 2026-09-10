@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -94,6 +95,76 @@ class CharacterResolverTests(unittest.TestCase):
         self.assertEqual(first["resolved_tag"], "lillie (pokemon)")
         self.assertEqual(second["cache_hit"], "plan")
         self.assertEqual(model_plan.call_count, 1)
+
+    def test_franchise_prefixed_and_short_name_share_canonical_plan(self):
+        plan = {
+            "candidate_tags": ["lusamine (pokemon)"],
+            "existing_character_tags": [],
+            "note": "same person",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "characters.json"
+            with patch.object(
+                character_resolver,
+                "_model_plan",
+                return_value=plan,
+            ) as model_plan:
+                first = character_resolver.resolve_character(
+                    query="宝可梦露莎米奈",
+                    base_prompt="1girl, blonde hair",
+                    lookup=verified,
+                    cache_path=cache_path,
+                )
+                second = character_resolver.resolve_character(
+                    query="露莎米奈",
+                    base_prompt="1girl, blonde hair",
+                    lookup=verified,
+                    cache_path=cache_path,
+                )
+
+        self.assertEqual(first["resolved_tag"], "lusamine (pokemon)")
+        self.assertEqual(second["resolved_tag"], "lusamine (pokemon)")
+        self.assertEqual(second["cache_hit"], "alias_plan")
+        self.assertEqual(model_plan.call_count, 1)
+
+    def test_manual_tag_and_aliases_are_verified_and_saved(self):
+        plan = {
+            "candidate_tags": ["wrong character"],
+            "existing_character_tags": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "characters.json"
+            with patch.object(character_resolver, "_model_plan", return_value=plan):
+                result = character_resolver.resolve_character(
+                    query="宝可梦露莎米奈",
+                    base_prompt="1girl",
+                    preferred_tag="lusamine (pokemon)",
+                    user_aliases="露莎米奈，宝可梦妈妈",
+                    lookup=verified,
+                    cache_path=cache_path,
+                )
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["resolved_tag"], "lusamine (pokemon)")
+        self.assertTrue(result["manual_tag_used"])
+        self.assertEqual(
+            set(result["saved_aliases"]),
+            {"宝可梦露莎米奈", "露莎米奈", "宝可梦妈妈"},
+        )
+        self.assertEqual(
+            cache["aliases"]["露莎米奈"]["tag"],
+            "lusamine (pokemon)",
+        )
+
+    def test_ambiguous_short_alias_does_not_guess(self):
+        aliases = {
+            "作品甲小雪": {"tag": "character a"},
+            "作品乙小雪": {"tag": "character b"},
+        }
+        self.assertEqual(
+            character_resolver._cached_alias_for_query("小雪", aliases),
+            "",
+        )
 
     def test_verified_character_replaces_only_verified_existing_character(self):
         plan = {

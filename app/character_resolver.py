@@ -179,6 +179,86 @@ def _plan_cache_key(query_key: str, mode: str, base_prompt: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _requested_aliases(
+    query: str,
+    user_aliases: Iterable[str] | str,
+) -> List[str]:
+    if isinstance(user_aliases, str):
+        supplied = re.split(r"[,，、\n]+", user_aliases)
+    else:
+        supplied = list(user_aliases or ())
+    output: List[str] = []
+    seen = set()
+    for value in [query, *supplied]:
+        label = str(value or "").strip()
+        key = _normalize_query(label)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(label)
+    return output
+
+
+def _cached_alias_for_query(
+    query_key: str,
+    aliases: Dict[str, Any],
+) -> str:
+    """Return an exact or unambiguous suffix-alias character tag."""
+    exact = aliases.get(query_key)
+    if isinstance(exact, dict):
+        return _normalize_tag(exact.get("tag", ""))
+
+    franchise_only = {
+        _normalize_query(value)
+        for value in set(QUERY_ALIASES) | set(QUERY_ALIASES.values())
+    }
+    if len(query_key) < 3 or query_key in franchise_only:
+        return ""
+
+    matches = set()
+    for cached_key, row in aliases.items():
+        if not isinstance(row, dict):
+            continue
+        cached_key = _normalize_query(cached_key)
+        shorter, longer = sorted((query_key, cached_key), key=len)
+        if (
+            len(shorter) >= 3
+            and shorter not in franchise_only
+            and longer.endswith(shorter)
+        ):
+            tag = _normalize_tag(row.get("tag", ""))
+            if tag:
+                matches.add(tag)
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
+def _store_alias_rows(
+    aliases: Dict[str, Any],
+    *,
+    labels: Iterable[str],
+    resolved_tag: str,
+    model: str,
+    query: str,
+) -> List[str]:
+    saved: List[str] = []
+    query_key = _normalize_query(query)
+    for label in labels:
+        label = str(label or "").strip()
+        key = _normalize_query(label)
+        if not key:
+            continue
+        aliases[key] = {
+            "query": label,
+            "tag": resolved_tag,
+            "model": model,
+            "source": (
+                "resolved_query" if key == query_key else "user_confirmed"
+            ),
+        }
+        saved.append(label)
+    return saved
+
+
 def _split_prompt(text: str) -> List[str]:
     return [
         " ".join(part.strip().split())
@@ -377,6 +457,8 @@ def resolve_character(
     mode: str = "identity_only",
     cache_path: Path = DEFAULT_CACHE_PATH,
     force_refresh: bool = False,
+    user_aliases: Iterable[str] | str = (),
+    preferred_tag: str = "",
 ) -> Dict[str, Any]:
     """Resolve and verify one character override request."""
     query = str(query or "").strip()
@@ -397,10 +479,46 @@ def resolve_character(
         aliases = {}
     if not isinstance(plans, dict):
         plans = {}
+    alias_labels = _requested_aliases(query, user_aliases)
+    preferred_tag = _normalize_tag(preferred_tag)
+    preferred_check: Dict[str, Any] = {}
+    if preferred_tag:
+        preferred_check = dict(lookup(preferred_tag))
+        if not _is_verified_character(preferred_check):
+            raise ValueError(
+                "手动填写的人物 tag 没有通过 NAID character 精确验证。"
+            )
+        preferred_tag = _normalize_tag(
+            preferred_check.get("tag", preferred_tag)
+        )
+    cached_alias = ""
+    if not force_refresh:
+        cached_alias = _cached_alias_for_query(query_key, aliases)
+    if preferred_tag:
+        cached_alias = preferred_tag
     plan_key = _plan_cache_key(query_key, mode, base_prompt)
 
     if not force_refresh:
-        cached_plan = plans.get(plan_key)
+        cached_plan = None
+        cache_hit = ""
+        plan_candidates = []
+        if not preferred_tag:
+            plan_candidates.append((plan_key, "plan"))
+        if cached_alias:
+            plan_candidates.append(
+                (
+                    _plan_cache_key(
+                        f"tag:{cached_alias}", mode, base_prompt
+                    ),
+                    "manual_plan" if preferred_tag else "alias_plan",
+                )
+            )
+        for candidate_key, hit_name in plan_candidates:
+            candidate_plan = plans.get(candidate_key) if candidate_key else None
+            if isinstance(candidate_plan, dict):
+                cached_plan = candidate_plan
+                cache_hit = hit_name
+                break
         if isinstance(cached_plan, dict):
             cached_tag = _normalize_tag(cached_plan.get("resolved_tag", ""))
             checked = dict(lookup(cached_tag)) if cached_tag else {}
@@ -434,6 +552,21 @@ def resolve_character(
                         and _is_appearance_tag(base_by_key[key])
                     )
                 ]
+                saved_aliases = _store_alias_rows(
+                    aliases,
+                    labels=alias_labels,
+                    resolved_tag=cached_tag,
+                    model=model,
+                    query=query,
+                )
+                cache.update(
+                    {
+                        "version": CACHE_VERSION,
+                        "aliases": aliases,
+                        "plans": plans,
+                    }
+                )
+                _write_cache(cache_path, cache)
                 return {
                     "query": query,
                     "mode": mode,
@@ -449,14 +582,10 @@ def resolve_character(
                     "note": str(cached_plan.get("note", "") or ""),
                     "error": "",
                     "model": model,
-                    "cache_hit": "plan",
+                    "cache_hit": cache_hit,
+                    "saved_aliases": saved_aliases,
+                    "manual_tag_used": bool(preferred_tag),
                 }
-
-    cached_alias = ""
-    if not force_refresh:
-        alias_row = aliases.get(query_key)
-        if isinstance(alias_row, dict):
-            cached_alias = _normalize_tag(alias_row.get("tag", ""))
 
     plan = _model_plan(
         query,
@@ -592,15 +721,19 @@ def resolve_character(
         "error": error,
         "model": model,
         "cache_hit": "alias" if cached_alias else "",
+        "saved_aliases": [],
+        "manual_tag_used": bool(preferred_tag),
     }
 
     if resolved_tag:
-        aliases[query_key] = {
-            "query": query,
-            "tag": resolved_tag,
-            "model": model,
-        }
-        plans[plan_key] = {
+        result["saved_aliases"] = _store_alias_rows(
+            aliases,
+            labels=alias_labels,
+            resolved_tag=resolved_tag,
+            model=model,
+            query=query,
+        )
+        plan_row = {
             "query": query,
             "mode": mode,
             "resolved_tag": resolved_tag,
@@ -609,6 +742,10 @@ def resolve_character(
             "note": note,
             "model": model,
         }
+        plans[plan_key] = plan_row
+        plans[
+            _plan_cache_key(f"tag:{resolved_tag}", mode, base_prompt)
+        ] = plan_row
         cache.update(
             {
                 "version": CACHE_VERSION,

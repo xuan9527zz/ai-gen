@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.4.0
+Illustrious Reconstruction Studio v2.4.1
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
@@ -15,7 +15,7 @@ Local/LAN browser workspace for:
 Expected sibling files:
     illustrious_web_ui.py
     illustrious_generate.py          # use Generator v1.1+
-    illustrious_orchestrator.py      # Analyzer v2.5.1+
+    illustrious_orchestrator.py      # Analyzer v2.5.2+
     illustrious_db.py                # DB v1.1+
     illustrious_generation_config.json
     anime.json
@@ -105,6 +105,7 @@ from . import generator  # noqa: E402
 from . import analyzer  # noqa: E402
 from . import database as analysis_db  # noqa: E402
 from . import character_resolver  # noqa: E402
+from . import source_tags as source_tag_adapter  # noqa: E402
 
 
 HOST = "0.0.0.0"
@@ -3803,6 +3804,7 @@ def json_list_to_text(
 
 def pixiv_verification_html(
     raw_json: Any,
+    run_id: int,
 ) -> str:
     try:
         payload = json.loads(
@@ -3850,6 +3852,32 @@ def pixiv_verification_html(
         [],
     )
 
+    combined_records: Dict[str, Dict[str, Any]] = {}
+    mapping_records = source.get("mapping_records", [])
+    if isinstance(mapping_records, list):
+        for record in mapping_records:
+            if not isinstance(record, dict):
+                continue
+            source_tag = str(record.get("source_tag", "") or "").strip()
+            if source_tag:
+                combined_records[source_tag] = dict(record)
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            source_tag = str(record.get("source_tag", "") or "").strip()
+            if source_tag:
+                combined_records.setdefault(source_tag, {}).update(record)
+    raw_tags = source.get("source_tags_raw_list", [])
+    if isinstance(raw_tags, list):
+        for raw_tag in raw_tags:
+            source_tag = str(raw_tag or "").strip()
+            if source_tag:
+                combined_records.setdefault(
+                    source_tag,
+                    {"source_tag": source_tag},
+                )
+
     status = str(
         verification.get(
             "status",
@@ -3859,7 +3887,7 @@ def pixiv_verification_html(
     )
 
     if (
-        not records
+        not combined_records
         and status
         in {
             "",
@@ -3871,12 +3899,7 @@ def pixiv_verification_html(
     rows = []
 
     for record in (
-        records
-        if isinstance(
-            records,
-            list,
-        )
-        else []
+        combined_records.values()
     ):
         if not isinstance(
             record,
@@ -4015,6 +4038,11 @@ def pixiv_verification_html(
         ):
             suggested = []
 
+        mapped_tags = record.get("mapped_tags", [])
+        if not isinstance(mapped_tags, list):
+            mapped_tags = []
+        mapping_source = str(record.get("mapping_source", "") or "")
+
         decision = ""
 
         if auto_added:
@@ -4043,6 +4071,66 @@ def pixiv_verification_html(
                 + "</div>"
             )
 
+        if mapped_tags:
+            mapping_label = (
+                "个人映射"
+                if mapping_source == "user_confirmed"
+                else "公开映射"
+            )
+            decision += (
+                "<div class='small status-good'>"
+                + esc(mapping_label)
+                + ": "
+                + esc(", ".join(str(x) for x in mapped_tags))
+                + "</div>"
+            )
+
+        suggested_value = ", ".join(
+            str(x)
+            for x in (
+                mapped_tags
+                or auto_added
+                or suggested
+                or candidates
+            )
+        )
+
+        manual_form = """
+          <form
+            method="post"
+            action="/save-pixiv-mapping"
+            style="margin-top:8px"
+            onsubmit="return submitWithProgress(
+              event,
+              this,
+              '正在保存个人映射并重新分析…'
+            )"
+          >
+            <input type="hidden" name="run_id" value="{run_id}">
+            <input type="hidden" name="source_tag" value="{source_tag}">
+            <div class="toolbar">
+              <div class="field grow">
+                <label>我确认的转换 Prompt（多个 tag 用逗号分隔）</label>
+                <input
+                  name="mapped_prompt"
+                  type="text"
+                  value="{suggested_value}"
+                  placeholder="例如：long hair, blonde hair"
+                  required
+                >
+              </div>
+
+              <button type="submit" class="secondary">
+                保存并重新分析
+              </button>
+            </div>
+          </form>
+        """.format(
+            run_id=int(run_id),
+            source_tag=esc(source_tag),
+            suggested_value=esc(suggested_value),
+        )
+
         rows.append(
             """
             <div style="
@@ -4055,6 +4143,7 @@ def pixiv_verification_html(
               </div>
               {verification_bits}
               {decision}
+              {manual_form}
             </div>
             """.format(
                 source_tag=esc(
@@ -4078,6 +4167,7 @@ def pixiv_verification_html(
                     )
                 ),
                 decision=decision,
+                manual_form=manual_form,
             )
         )
 
@@ -4114,6 +4204,9 @@ def pixiv_verification_html(
         "<div class='panel'>"
         "<details open>"
         "<summary>Pixiv → NAID Tag Verification</summary>"
+        "<div class='small muted'>AI 结果只是候选；你保存的个人映射优先，"
+        "记录在本地 data/pixiv_tag_overrides.json，并通过新 Analysis Run 应用。"
+        "</div>"
         + status_line
         + "".join(
             rows
@@ -4445,7 +4538,8 @@ def page_html(
             pixiv_verification_html(
                 selected[
                     "raw_json"
-                ]
+                ],
+                int(selected["id"]),
             )
         )
 
@@ -5044,6 +5138,27 @@ def page_html(
                 </button>
               </div>
 
+              <div class="toolbar" style="margin-top:8px">
+                <div class="field grow">
+                  <label>人工指定 Danbooru 人物 tag（可选）</label>
+                  <input
+                    id="character-preferred-tag"
+                    type="text"
+                    placeholder="例如：lusamine (pokemon)"
+                    oninput="clearCharacterResolution()"
+                  >
+                </div>
+                <div class="field grow">
+                  <label>同时记录的中文别名（可选）</label>
+                  <input
+                    id="character-aliases"
+                    type="text"
+                    placeholder="例如：宝可梦露莎米奈，露莎米奈"
+                    oninput="clearCharacterResolution()"
+                  >
+                </div>
+              </div>
+
               <input
                 id="resolved-character-tag"
                 name="resolved_character_tag"
@@ -5080,6 +5195,8 @@ def page_html(
               <div class="small muted">
                 中文名、常见译名和轻微误差先由本地模型理解；只有通过
                 NAID character exact-match 的 Danbooru tag 才会自动写入。
+                人工指定的 tag 也必须通过相同核验；成功后查询文字和别名
+                会保存在本地人物词典，下次可直接复用。
                 “优先角色原设”会清除原图中的发色、瞳色、发型、服装与佩饰
                 tags，但保留动作、构图、背景、光照和画风。
               </div>
@@ -5403,7 +5520,7 @@ def page_html(
 <header>
   <div class="header-inner">
     <div>
-      <h1>Illustrious Reconstruction Studio v2.4.0</h1>
+      <h1>Illustrious Reconstruction Studio v2.4.1</h1>
       <div class="header-sub">
         Analyze · Correct · Generate · Compare · Learn
       </div>
@@ -5660,6 +5777,8 @@ function clearCharacterResolution() {{
 
 async function resolveCharacter() {{
   const query = document.getElementById('character-query');
+  const preferredTag = document.getElementById('character-preferred-tag');
+  const aliases = document.getElementById('character-aliases');
   const base = document.getElementById('base-prompt');
   const model = document.getElementById('correction-model');
   const mode = document.getElementById('character-mode');
@@ -5696,7 +5815,9 @@ async function resolveCharacter() {{
         base_prompt: base ? base.value : '',
         model: model ? model.value : '',
         mode: mode ? mode.value : 'identity_only',
-        force_refresh: forceRefresh ? forceRefresh.checked : false
+        force_refresh: forceRefresh ? forceRefresh.checked : false,
+        preferred_tag: preferredTag ? preferredTag.value : '',
+        user_aliases: aliases ? aliases.value : ''
       }})
     }});
     const data = await response.json();
@@ -5719,6 +5840,9 @@ async function resolveCharacter() {{
       details.push('移除原图外观约束：' + appearanceTags.join(', '));
     }}
     if (!details.length) details.push('没有需要移除的冲突 tag');
+    if ((data.saved_aliases || []).length) {{
+      details.push('已记录别名：' + data.saved_aliases.join(' / '));
+    }}
     const cacheText = data.cache_hit ? '（已使用本地缓存）' : '';
     note.textContent = '已验证：' + data.resolved_tag + cacheText
       + '；' + details.join('；');
@@ -5740,6 +5864,10 @@ function resetPromptEditor() {{
   const finalBox = document.getElementById('final-prompt');
   const note = document.getElementById('ai-note');
   const characterQuery = document.getElementById('character-query');
+  const characterPreferredTag = document.getElementById(
+    'character-preferred-tag'
+  );
+  const characterAliases = document.getElementById('character-aliases');
   const characterTag = document.getElementById('resolved-character-tag');
   const characterRemove = document.getElementById('character-remove-tags');
   const characterIdentityRemove = document.getElementById(
@@ -5760,6 +5888,8 @@ function resetPromptEditor() {{
   if (manual) manual.value = '';
   if (note) note.textContent = '';
   if (characterQuery) characterQuery.value = '';
+  if (characterPreferredTag) characterPreferredTag.value = '';
+  if (characterAliases) characterAliases.value = '';
   if (characterTag) characterTag.value = '';
   if (characterRemove) characterRemove.value = '';
   if (characterIdentityRemove) characterIdentityRemove.value = '';
@@ -5867,6 +5997,14 @@ function loadGenerationPrompt(prompt) {{
     'character-query'
   );
 
+  const characterPreferredTag = document.getElementById(
+    'character-preferred-tag'
+  );
+
+  const characterAliases = document.getElementById(
+    'character-aliases'
+  );
+
   const characterTag = document.getElementById(
     'resolved-character-tag'
   );
@@ -5902,6 +6040,8 @@ function loadGenerationPrompt(prompt) {{
   if (remove) remove.value = '';
   if (manual) manual.value = '';
   if (characterQuery) characterQuery.value = '';
+  if (characterPreferredTag) characterPreferredTag.value = '';
+  if (characterAliases) characterAliases.value = '';
   if (characterTag) characterTag.value = '';
   if (characterRemove) characterRemove.value = '';
   if (characterIdentityRemove) characterIdentityRemove.value = '';
@@ -5961,6 +6101,9 @@ function operationProgressText(action, fallbackText) {{
 
   if (path === '/upload-analyze' || path === '/reanalyze') {{
     return '正在识图：VLM 与 WD14 正在分析图片…';
+  }}
+  if (path === '/save-pixiv-mapping') {{
+    return '正在保存个人 Pixiv 映射，并用它重新分析原图…';
   }}
   if (path === '/diagnose-generation') {{
     return '正在生成 A–E 诊断图：ComfyUI 将依次完成 5 张…';
@@ -6610,6 +6753,18 @@ class Handler(
                                 False,
                             )
                         ),
+                        preferred_tag=str(
+                            payload.get(
+                                "preferred_tag",
+                                "",
+                            )
+                        ),
+                        user_aliases=str(
+                            payload.get(
+                                "user_aliases",
+                                "",
+                            )
+                        ),
                     )
                 finally:
                     CHARACTER_LOCK.release()
@@ -6839,6 +6994,75 @@ class Handler(
 
         # Remaining POST routes are urlencoded.
         form = self.parse_urlencoded_form()
+
+        # ----------------------------------------------------
+        # User-confirmed Pixiv source-tag mapping
+        # ----------------------------------------------------
+
+        if parsed.path == "/save-pixiv-mapping":
+            old_run_id = int(first_value(form, "run_id"))
+            try:
+                source_tag = first_value(form, "source_tag", "").strip()
+                mapped_prompt = first_value(
+                    form,
+                    "mapped_prompt",
+                    "",
+                ).strip()
+
+                conn = connect_db()
+                try:
+                    old_run = get_analysis_run(conn, old_run_id)
+                finally:
+                    conn.close()
+                if not old_run:
+                    raise ValueError("找不到原 Analysis Run。")
+
+                raw_payload = json.loads(str(old_run["raw_json"] or "{}"))
+                source = raw_payload.get("source", {})
+                if not isinstance(source, dict) or source.get("source_type") != "pixiv":
+                    raise ValueError("这条 Analysis Run 不是 Pixiv 来源。")
+                raw_tags = source.get("source_tags_raw_list", [])
+                if source_tag not in raw_tags:
+                    raise ValueError("提交的 Pixiv tag 不属于这条 Analysis Run。")
+
+                if not ANALYSIS_LOCK.acquire(blocking=False):
+                    raise RuntimeError("已有分析任务正在运行。")
+                try:
+                    mapped_tags = source_tag_adapter.save_pixiv_user_mapping(
+                        source_tag,
+                        mapped_prompt,
+                    )
+                    image_path = original_path_for_run(old_run_id)
+                    if image_path is None or not image_path.is_file():
+                        raise FileNotFoundError("找不到原图。")
+                    new_run_id, _result, _json_path = analyze_and_import(
+                        image_path,
+                        source_type="pixiv",
+                        source_tags_text=str(source.get("source_tags_raw", "") or ""),
+                    )
+                finally:
+                    ANALYSIS_LOCK.release()
+
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": new_run_id,
+                        "message": (
+                            f"已记录 {source_tag} → {', '.join(mapped_tags)}；"
+                            f"新建 Analysis Run #{new_run_id}。"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                self.redirect(
+                    "/",
+                    {
+                        "run_id": old_run_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            return
 
         # ----------------------------------------------------
         # User-selected best candidate (personal preference)

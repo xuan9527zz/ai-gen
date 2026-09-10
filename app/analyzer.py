@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Illustrious Image Analyzer / Orchestrator V2.5.1
+Illustrious Image Analyzer / Orchestrator V2.5.2
+
+V2.5.2 user-confirmed mapping provenance:
+- Merge local Pixiv tag overrides above the public Japanese mapping.
+- Record the raw-tag-to-prompt mapping source in every new Analysis Run.
 
 V2.5.1 visual-style retention:
 - Requires the merger to cover every explicitly described high-level category.
@@ -3396,7 +3400,7 @@ def analyze_image(
     print()
     print("=" * 60)
     print(
-        "Illustrious Image Analyzer V2.5.1"
+        "Illustrious Image Analyzer V2.5.2"
     )
     print("=" * 60)
     print(f"图片：{image_path}")
@@ -3854,7 +3858,7 @@ def analyze_image(
         "timestamp": time.strftime(
             "%Y-%m-%d %H:%M:%S"
         ),
-        "version": "2.5.1",
+        "version": "2.5.2",
         "models": {
             "vlm": VLM_MODEL,
             "merger": MERGER_MODEL,
@@ -3884,6 +3888,10 @@ def analyze_image(
             "normalized_tags": source_tags,
             "known_mapped_tags": source_info.get(
                 "normalized_tags",
+                [],
+            ),
+            "mapping_records": source_info.get(
+                "mapping_records",
                 [],
             ),
             "unknown_tags": source_info.get(

@@ -2,7 +2,7 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.8**
+当前打包版本：**v0.5.9**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
@@ -14,6 +14,7 @@
 - Danbooru Source Tags 清洗
 - Pixiv 日文 Tags 映射
 - Pixiv unknown tag → 本地 LLM 语义映射 → NAIDv3 Tag Search exact-match / Power 验证
+- 每条 Pixiv 转换结果都可人工改写，并保存为本地优先的个人映射
 - Analyzer Final Prompt 与 provenance 保存
 - SQLite 保存多次 Analysis Run
 - ComfyUI API 自动生成
@@ -26,6 +27,7 @@
 - 中文/别名/轻微误差人物输入 → Danbooru character tag → NAID 精确验证
 - 已验证的人物覆盖与原人物 tag 安全替换，并保存完整 provenance
 - 保留原图造型 / 优先角色原设两种人物覆盖模式与本地人物解析缓存
+- 可人工指定已验证的人物 tag，并把多个中文写法记录为同一人物别名
 - Manual Positive Prompt
 - 原图 / 生成图对比
 - 总体 / 内容 / 风格 / 构图四项 1–5 分评分与备注
@@ -210,6 +212,26 @@ Danbooru fallback / unknown / lookup unavailable
 → 不自动加入，只保留为 suggested/unverified
 ```
 
+每条转换结果下方都有“我确认的转换 Prompt”。保存后会写入本地：
+
+```text
+data/pixiv_tag_overrides.json
+```
+
+个人映射的优先级高于公开 `jp_to_danbooru_tags.json`，并会新建一次
+Analysis Run 立即应用；旧 Run 不会被覆盖。该文件位于 `data/`，不会提交 GitHub。
+
+人物框也支持填写可选的 Danbooru 人物 tag 和多个中文别名。例如把：
+
+```text
+宝可梦露莎米奈，露莎米奈
+→ lusamine (pokemon)
+```
+
+保存到本地人物缓存。人工人物 tag 仍必须通过 NAID character exact-match；
+以后输入带作品名前缀或不带前缀的唯一别名，都可直接复用。若一个短名称对应
+多个已记录角色，系统不会猜测，会重新核验。
+
 NAID 查询会保存在本地 cache，避免重复请求外部免费站点。
 
 ## 6. 数据与隐私
@@ -286,7 +308,7 @@ Image
 
 同一 Prompt 也可以生成多个不同 seed，并分别评分。
 
-Analyzer v2.5.1 会在 run JSON / SQLite `raw_json` 中分别保留：
+Analyzer v2.5.2 会在 run JSON / SQLite `raw_json` 中分别保留：
 
 ```text
 visual_features_model_raw       = merger 模型提取结果
