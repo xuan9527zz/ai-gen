@@ -57,7 +57,9 @@ APPEARANCE_MARKERS = {
     "collar", "necktie", "bowtie", "ribbon", "hat", "cap", "beret",
     "crown", "headwear", "glasses", "eyewear", "scarf", "armor",
     "robe", "kimono", "yukata", "apron", "belt", "choker", "necklace",
-    "earrings", "earring",
+    "earrings", "earring", "horn", "horns", "wing", "wings", "tail",
+    "animal ears", "pointy ears", "halo", "fang", "fangs", "skin",
+    "freckles", "mole", "hair ornament", "hair clip", "hairband",
 }
 
 APPEARANCE_CONTEXT_EXCLUSIONS = {

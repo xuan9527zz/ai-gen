@@ -2,7 +2,7 @@
 
 本地运行的动漫图像 **分析 → Prompt 重建 → ComfyUI 生图 → 人工更正/评分** 工作台。
 
-当前打包版本：**v0.5.9**
+当前打包版本：**v0.6.0**
 
 > 设计目标：模型和个人数据留在自己的电脑上；电脑负责 GPU 推理，手机只作为控制界面。
 
@@ -28,6 +28,8 @@
 - 已验证的人物覆盖与原人物 tag 安全替换，并保存完整 provenance
 - 保留原图造型 / 优先角色原设两种人物覆盖模式与本地人物解析缓存
 - 可人工指定已验证的人物 tag，并把多个中文写法记录为同一人物别名
+- 独立人物原设库：上传设定图 → WD14 外观候选 → 人工修改 → 本地 JSON
+- 主生成页按 A 现有 Prompt 优先 / B 平衡 / C 人物原设优先合并人物档案
 - Manual Positive Prompt
 - 原图 / 生成图对比
 - 总体 / 内容 / 风格 / 构图四项 1–5 分评分与备注
@@ -47,6 +49,7 @@ illustrious-reconstruction-studio/
 │  ├─ image_inputs.py
 │  ├─ source_tags.py
 │  ├─ character_resolver.py
+│  ├─ character_profiles.py
 │  ├─ naid_verifier.py
 │  └─ web_ui.py
 ├─ config/
@@ -231,6 +234,34 @@ Analysis Run 立即应用；旧 Run 不会被覆盖。该文件位于 `data/`，
 保存到本地人物缓存。人工人物 tag 仍必须通过 NAID character exact-match；
 以后输入带作品名前缀或不带前缀的唯一别名，都可直接复用。若一个短名称对应
 多个已记录角色，系统不会猜测，会重新核验。
+
+### 人物原设库
+
+主页面右上角打开“人物原设库”，或者访问：
+
+```text
+http://127.0.0.1:8765/character-studio
+```
+
+输入人物名称、可选 Danbooru 人物 tag 和中文别名，再上传最多 5 张干净的
+人物立绘/设定图。Studio 会调用现有 ComfyUI WD14，保留发色、瞳色、发型、
+服装、饰品和标志性外观候选；动作、背景、画质词和露骨内容不会进入档案。
+你确认或修改加强 Prompt 后，档案保存在：
+
+```text
+data/character_profiles.json
+```
+
+主页面解析到同一个 Danbooru character tag 时会自动读取该档案。冲突级别：
+
+```text
+A = 现有分析 Prompt 优先；只加入不冲突的原设词
+B = 平衡；保留现有词，同时加入全部原设词
+C = 人物原设优先；删除同类冲突的现有外观词，再加入全部原设词
+```
+
+档案指纹、实际加入词、冲突词和删除词会随 generation prompt-edit provenance
+保存；Analyzer 原始 Prompt 和旧 Analysis Run 不会被改写。
 
 NAID 查询会保存在本地 cache，避免重复请求外部免费站点。
 

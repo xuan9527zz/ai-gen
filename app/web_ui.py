@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-Illustrious Reconstruction Studio v2.4.1
+Illustrious Reconstruction Studio v2.5.0
 
 Local/LAN browser workspace for:
 1) image library + new-image analysis + re-analysis
@@ -105,6 +105,7 @@ from . import generator  # noqa: E402
 from . import analyzer  # noqa: E402
 from . import database as analysis_db  # noqa: E402
 from . import character_resolver  # noqa: E402
+from . import character_profiles  # noqa: E402
 from . import source_tags as source_tag_adapter  # noqa: E402
 
 
@@ -115,6 +116,7 @@ GENERATION_LOCK = threading.Lock()
 ANALYSIS_LOCK = threading.Lock()
 CORRECTION_LOCK = threading.Lock()
 CHARACTER_LOCK = threading.Lock()
+CHARACTER_PROFILE_LOCK = threading.Lock()
 AUTO_IMPROVE_LOCK = threading.Lock()
 
 ALLOWED_IMAGE_EXTENSIONS = {
@@ -2296,7 +2298,7 @@ def character_override_from_form(
     base_prompt: str,
     final_prompt: str,
 ) -> Dict[str, Any]:
-    return character_resolver.validate_character_override(
+    result = character_resolver.validate_character_override(
         query=first_value(form, "character_query", ""),
         resolved_tag=first_value(
             form,
@@ -2325,6 +2327,78 @@ def character_override_from_form(
             "identity_only",
         ),
     )
+    if not result:
+        return result
+
+    priority = first_value(
+        form,
+        "character_profile_priority",
+        "b",
+    ).strip().lower()
+    profile = character_profiles.get_profile(result["resolved_tag"])
+    submitted_fingerprint = first_value(
+        form,
+        "character_profile_fingerprint",
+        "",
+    ).strip()
+    if not profile:
+        if submitted_fingerprint:
+            raise ValueError("人物原设档案已经不存在，请重新解析人物。")
+        return result
+
+    application = character_profiles.apply_profile(
+        base_prompt,
+        profile,
+        priority,
+    )
+    if submitted_fingerprint != application["profile_fingerprint"]:
+        raise ValueError("人物原设档案已更新，请重新解析人物后再生成。")
+
+    submitted_profile_adds = split_prompt_fragments(
+        first_value(form, "character_profile_add_tags", "")
+    )
+    submitted_profile_removes = split_prompt_fragments(
+        first_value(form, "character_profile_remove_tags", "")
+    )
+    expected_adds = application["add_tags"]
+    expected_removes = application["remove_tags"]
+    if {
+        normalize_tag_key(x) for x in submitted_profile_adds
+    } != {
+        normalize_tag_key(x) for x in expected_adds
+    }:
+        raise ValueError("人物原设加强词已过期，请重新解析人物。")
+    if {
+        normalize_tag_key(x) for x in submitted_profile_removes
+    } != {
+        normalize_tag_key(x) for x in expected_removes
+    }:
+        raise ValueError("人物原设冲突项已过期，请重新解析人物。")
+    if {
+        normalize_tag_key(x)
+        for x in result.get("appearance_remove_tags", [])
+    } != {
+        normalize_tag_key(x) for x in expected_removes
+    }:
+        raise ValueError("人物原设实际删除项不一致，请重新解析人物。")
+
+    final_keys = {
+        normalize_tag_key(x) for x in split_prompt_fragments(final_prompt)
+    }
+    if any(normalize_tag_key(x) not in final_keys for x in expected_adds):
+        raise ValueError("最终 Prompt 缺少人物原设加强词，请重新计算 Prompt。")
+    if any(normalize_tag_key(x) in final_keys for x in expected_removes):
+        raise ValueError("最终 Prompt 仍包含人物原设冲突词，请重新计算 Prompt。")
+
+    expected_mode = "canonical" if expected_removes else "identity_only"
+    if result.get("mode") != expected_mode:
+        raise ValueError("人物原设冲突级别已变化，请重新解析人物。")
+    result["profile"] = {
+        "character_tag": profile.get("character_tag", ""),
+        "names": profile.get("names", []),
+        **application,
+    }
+    return result
 
 
 # ============================================================
@@ -2967,6 +3041,17 @@ header h1 {
   border-radius: 999px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.nav-link {
+  display: inline-block;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--panel);
+  text-decoration: none;
+  font-size: 13px;
 }
 
 main {
@@ -5113,7 +5198,7 @@ def page_html(
                 </div>
 
                 <div class="field grow">
-                  <label>替换方式</label>
+                  <label>无人物原设档案时的替换方式</label>
                   <select
                     id="character-mode"
                     name="character_mode"
@@ -5159,6 +5244,25 @@ def page_html(
                 </div>
               </div>
 
+              <div class="field" style="margin-top:8px">
+                <label>人物原设档案冲突级别</label>
+                <select
+                  id="character-profile-priority"
+                  name="character_profile_priority"
+                  onchange="clearCharacterResolution()"
+                >
+                  <option value="a">
+                    A · 以现有分析 Prompt 为主
+                  </option>
+                  <option value="b" selected>
+                    B · 平衡合并
+                  </option>
+                  <option value="c">
+                    C · 以人物原设 Prompt 为主
+                  </option>
+                </select>
+              </div>
+
               <input
                 id="resolved-character-tag"
                 name="resolved_character_tag"
@@ -5187,6 +5291,27 @@ def page_html(
                 value=""
               >
 
+              <input
+                id="character-profile-add-tags"
+                name="character_profile_add_tags"
+                type="hidden"
+                value=""
+              >
+
+              <input
+                id="character-profile-remove-tags"
+                name="character_profile_remove_tags"
+                type="hidden"
+                value=""
+              >
+
+              <input
+                id="character-profile-fingerprint"
+                name="character_profile_fingerprint"
+                type="hidden"
+                value=""
+              >
+
               <div
                 id="character-note"
                 class="ai-note"
@@ -5197,8 +5322,11 @@ def page_html(
                 NAID character exact-match 的 Danbooru tag 才会自动写入。
                 人工指定的 tag 也必须通过相同核验；成功后查询文字和别名
                 会保存在本地人物词典，下次可直接复用。
+                如果已经建立人物原设档案，A 会跳过冲突的原设词，B 会同时
+                保留两边，C 会移除冲突的现有外观词后加入原设词。
                 “优先角色原设”会清除原图中的发色、瞳色、发型、服装与佩饰
                 tags，但保留动作、构图、背景、光照和画风。
+                <a href="/character-studio">打开人物原设库</a>
               </div>
 
               <label class="checkbox-inline small muted" style="margin-top:6px">
@@ -5520,15 +5648,18 @@ def page_html(
 <header>
   <div class="header-inner">
     <div>
-      <h1>Illustrious Reconstruction Studio v2.4.1</h1>
+      <h1>Illustrious Reconstruction Studio v2.5.0</h1>
       <div class="header-sub">
         Analyze · Correct · Generate · Compare · Learn
       </div>
     </div>
 
-    <div class="lan-pill">
-      手机：
-      http://{esc(lan_ip)}:{PORT}
+    <div class="toolbar">
+      <a class="nav-link" href="/character-studio">人物原设库</a>
+      <div class="lan-pill">
+        手机：
+        http://{esc(lan_ip)}:{PORT}
+      </div>
     </div>
   </div>
 </header>
@@ -5738,6 +5869,9 @@ function refreshPromptPreview() {{
   const characterRemove = document.getElementById(
     'character-remove-tags'
   );
+  const characterProfileAdd = document.getElementById(
+    'character-profile-add-tags'
+  );
   const manual = document.getElementById('manual-positive');
   const finalBox = document.getElementById('final-prompt');
 
@@ -5751,6 +5885,7 @@ function refreshPromptPreview() {{
     ].filter(Boolean).join(', '),
     [
       characterTag ? characterTag.value : '',
+      characterProfileAdd ? characterProfileAdd.value : '',
       add ? add.value : ''
     ].filter(Boolean).join(', '),
     manual ? manual.value : ''
@@ -5766,11 +5901,21 @@ function clearCharacterResolution() {{
   const appearanceRemove = document.getElementById(
     'character-appearance-remove-tags'
   );
+  const profileAdd = document.getElementById('character-profile-add-tags');
+  const profileRemove = document.getElementById(
+    'character-profile-remove-tags'
+  );
+  const profileFingerprint = document.getElementById(
+    'character-profile-fingerprint'
+  );
   const note = document.getElementById('character-note');
   if (tag) tag.value = '';
   if (remove) remove.value = '';
   if (identityRemove) identityRemove.value = '';
   if (appearanceRemove) appearanceRemove.value = '';
+  if (profileAdd) profileAdd.value = '';
+  if (profileRemove) profileRemove.value = '';
+  if (profileFingerprint) profileFingerprint.value = '';
   if (note) note.textContent = '';
   refreshPromptPreview();
 }}
@@ -5783,6 +5928,9 @@ async function resolveCharacter() {{
   const model = document.getElementById('correction-model');
   const mode = document.getElementById('character-mode');
   const forceRefresh = document.getElementById('character-force-refresh');
+  const profilePriority = document.getElementById(
+    'character-profile-priority'
+  );
   const tag = document.getElementById('resolved-character-tag');
   const remove = document.getElementById('character-remove-tags');
   const identityRemove = document.getElementById(
@@ -5790,6 +5938,13 @@ async function resolveCharacter() {{
   );
   const appearanceRemove = document.getElementById(
     'character-appearance-remove-tags'
+  );
+  const profileAdd = document.getElementById('character-profile-add-tags');
+  const profileRemove = document.getElementById(
+    'character-profile-remove-tags'
+  );
+  const profileFingerprint = document.getElementById(
+    'character-profile-fingerprint'
   );
   const note = document.getElementById('character-note');
   const button = document.getElementById('character-resolve-button');
@@ -5803,6 +5958,9 @@ async function resolveCharacter() {{
   remove.value = '';
   identityRemove.value = '';
   appearanceRemove.value = '';
+  profileAdd.value = '';
+  profileRemove.value = '';
+  profileFingerprint.value = '';
   note.textContent = '正在用本地模型解析，并核验 Danbooru character tag…';
   button.disabled = true;
 
@@ -5817,7 +5975,8 @@ async function resolveCharacter() {{
         mode: mode ? mode.value : 'identity_only',
         force_refresh: forceRefresh ? forceRefresh.checked : false,
         preferred_tag: preferredTag ? preferredTag.value : '',
-        user_aliases: aliases ? aliases.value : ''
+        user_aliases: aliases ? aliases.value : '',
+        profile_priority: profilePriority ? profilePriority.value : 'b'
       }})
     }});
     const data = await response.json();
@@ -5831,6 +5990,11 @@ async function resolveCharacter() {{
     identityRemove.value = identityTags.join(', ');
     appearanceRemove.value = appearanceTags.join(', ');
     remove.value = identityTags.concat(appearanceTags).join(', ');
+    const profile = data.profile || {{found: false}};
+    profileAdd.value = (profile.add_tags || []).join(', ');
+    profileRemove.value = (profile.remove_tags || []).join(', ');
+    profileFingerprint.value = profile.profile_fingerprint || '';
+    if (mode && data.mode) mode.value = data.mode;
 
     const details = [];
     if (identityTags.length) {{
@@ -5842,6 +6006,17 @@ async function resolveCharacter() {{
     if (!details.length) details.push('没有需要移除的冲突 tag');
     if ((data.saved_aliases || []).length) {{
       details.push('已记录别名：' + data.saved_aliases.join(' / '));
+    }}
+    if (profile.found) {{
+      details.push(
+        '已调用人物原设档案：加入 '
+        + (profile.add_tags || []).length
+        + ' 项，冲突 '
+        + Object.keys(profile.conflicts || {{}}).length
+        + ' 组'
+      );
+    }} else {{
+      details.push('尚未建立该人物的原设档案');
     }}
     const cacheText = data.cache_hit ? '（已使用本地缓存）' : '';
     note.textContent = '已验证：' + data.resolved_tag + cacheText
@@ -5868,6 +6043,18 @@ function resetPromptEditor() {{
     'character-preferred-tag'
   );
   const characterAliases = document.getElementById('character-aliases');
+  const characterProfilePriority = document.getElementById(
+    'character-profile-priority'
+  );
+  const characterProfileAdd = document.getElementById(
+    'character-profile-add-tags'
+  );
+  const characterProfileRemove = document.getElementById(
+    'character-profile-remove-tags'
+  );
+  const characterProfileFingerprint = document.getElementById(
+    'character-profile-fingerprint'
+  );
   const characterTag = document.getElementById('resolved-character-tag');
   const characterRemove = document.getElementById('character-remove-tags');
   const characterIdentityRemove = document.getElementById(
@@ -5890,6 +6077,10 @@ function resetPromptEditor() {{
   if (characterQuery) characterQuery.value = '';
   if (characterPreferredTag) characterPreferredTag.value = '';
   if (characterAliases) characterAliases.value = '';
+  if (characterProfilePriority) characterProfilePriority.value = 'b';
+  if (characterProfileAdd) characterProfileAdd.value = '';
+  if (characterProfileRemove) characterProfileRemove.value = '';
+  if (characterProfileFingerprint) characterProfileFingerprint.value = '';
   if (characterTag) characterTag.value = '';
   if (characterRemove) characterRemove.value = '';
   if (characterIdentityRemove) characterIdentityRemove.value = '';
@@ -6005,6 +6196,22 @@ function loadGenerationPrompt(prompt) {{
     'character-aliases'
   );
 
+  const characterProfilePriority = document.getElementById(
+    'character-profile-priority'
+  );
+
+  const characterProfileAdd = document.getElementById(
+    'character-profile-add-tags'
+  );
+
+  const characterProfileRemove = document.getElementById(
+    'character-profile-remove-tags'
+  );
+
+  const characterProfileFingerprint = document.getElementById(
+    'character-profile-fingerprint'
+  );
+
   const characterTag = document.getElementById(
     'resolved-character-tag'
   );
@@ -6042,6 +6249,10 @@ function loadGenerationPrompt(prompt) {{
   if (characterQuery) characterQuery.value = '';
   if (characterPreferredTag) characterPreferredTag.value = '';
   if (characterAliases) characterAliases.value = '';
+  if (characterProfilePriority) characterProfilePriority.value = 'b';
+  if (characterProfileAdd) characterProfileAdd.value = '';
+  if (characterProfileRemove) characterProfileRemove.value = '';
+  if (characterProfileFingerprint) characterProfileFingerprint.value = '';
   if (characterTag) characterTag.value = '';
   if (characterRemove) characterRemove.value = '';
   if (characterIdentityRemove) characterIdentityRemove.value = '';
@@ -6245,6 +6456,203 @@ refreshPromptPreview();
 refreshGenerationModeUi();
 </script>
 
+</body>
+</html>
+"""
+
+
+def character_studio_html(
+    *,
+    draft_id: str = "",
+    message: str = "",
+    error: str = "",
+) -> str:
+    draft = character_profiles.load_draft(draft_id) if draft_id else {}
+    profiles_data = character_profiles.load_profiles()
+    profiles = profiles_data.get("profiles", {})
+
+    message_html = (
+        f'<div class="message">{esc(message)}</div>' if message else ""
+    )
+    error_html = (
+        f'<div class="message error">{esc(error)}</div>' if error else ""
+    )
+
+    draft_html = ""
+    if draft:
+        outputs = draft.get("wd14_outputs", [])
+        output_rows = []
+        for index, output in enumerate(
+            outputs if isinstance(outputs, list) else [],
+            1,
+        ):
+            output_rows.append(
+                "<details><summary>参考图 "
+                + str(index)
+                + " 的完整 WD14 Tags</summary>"
+                + "<div class='prompt-box' style='margin-top:8px'>"
+                + esc(output)
+                + "</div></details>"
+            )
+        suggested = ", ".join(
+            str(x) for x in draft.get("suggested_tags", [])
+        )
+        names = " / ".join(str(x) for x in draft.get("names", []))
+        draft_html = f"""
+        <div class="panel">
+          <h2>WD14 分析结果</h2>
+          <div class="toolbar">
+            <div class="field grow">
+              <label>人物名称 / 别名</label>
+              <strong>{esc(names)}</strong>
+            </div>
+            <div class="field grow">
+              <label>已验证 Danbooru 人物 tag</label>
+              <strong>{esc(draft.get('character_tag', ''))}</strong>
+            </div>
+          </div>
+
+          <div style="margin-top:12px">{''.join(output_rows)}</div>
+
+          <form
+            method="post"
+            action="/character-studio/save"
+            onsubmit="return submitProfileJob(event, this, '正在保存人物原设档案…')"
+            style="margin-top:14px"
+          >
+            <input type="hidden" name="draft_id" value="{esc(draft_id)}">
+            <div class="field">
+              <label>人物原设加强 Prompt（请确认和修改）</label>
+              <textarea name="enhancement_prompt" class="final-prompt" required>{esc(suggested)}</textarea>
+            </div>
+            <div class="small muted" style="margin-top:6px">
+              这里只保存发色、瞳色、发型、服装、饰品和标志性外观。
+              动作、背景、画质词和露骨内容不会进入人物原设档案。
+            </div>
+            <button type="submit" style="margin-top:10px">保存到人物原设库</button>
+          </form>
+        </div>
+        """
+
+    profile_rows = []
+    if isinstance(profiles, dict):
+        for key, row in sorted(profiles.items()):
+            if not isinstance(row, dict):
+                continue
+            profile_rows.append(
+                "<div style='border-top:1px solid var(--border);padding:9px 0'>"
+                "<strong>" + esc(key) + "</strong>"
+                "<div class='small muted'>"
+                + esc(" / ".join(row.get("names", [])))
+                + "</div><div class='small'>"
+                + esc(", ".join(row.get("prompt_tags", [])))
+                + "</div></div>"
+            )
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>人物原设库 · Illustrious Studio</title>
+  <style>{CSS}</style>
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div>
+      <h1>人物原设库</h1>
+      <div class="header-sub">WD14 → 人工确认 → 本地 Character Profile JSON</div>
+    </div>
+    <a class="nav-link" href="/">返回生成工作台</a>
+  </div>
+</header>
+<main style="max-width:1050px">
+  {message_html}
+  {error_html}
+
+  <div class="panel">
+    <h2>分析新人物原设</h2>
+    <form
+      method="post"
+      action="/character-studio/analyze"
+      enctype="multipart/form-data"
+      onsubmit="return submitProfileJob(event, this, 'WD14 正在分析人物原设图…')"
+    >
+      <div class="toolbar">
+        <div class="field grow">
+          <label>人物名称</label>
+          <input name="character_name" type="text" placeholder="例如：龙华妃咲" required>
+        </div>
+        <div class="field grow">
+          <label>Danbooru 人物 tag（可选，留空则自动解析）</label>
+          <input name="character_tag" type="text" placeholder="知道时可直接填写">
+        </div>
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>其他中文别名（可选，逗号分隔）</label>
+        <input name="character_aliases" type="text" placeholder="带作品名、不带作品名等不同写法">
+      </div>
+      <div class="field" style="margin-top:10px">
+        <label>人物原设参考图（最多 5 张，建议干净立绘或设定图）</label>
+        <input name="profile_images" type="file" accept="image/*" multiple required>
+      </div>
+      <button type="submit" style="margin-top:12px">上传并用 WD14 分析</button>
+    </form>
+  </div>
+
+  {draft_html}
+
+  <div class="panel">
+    <h2>已保存人物原设</h2>
+    {''.join(profile_rows) if profile_rows else '<div class="muted">还没有保存人物原设。</div>'}
+  </div>
+</main>
+
+<div id="profile-progress" class="job-progress-overlay" role="status" hidden>
+  <div class="job-progress-card">
+    <h2>任务处理中</h2>
+    <div class="job-progress-track"><div class="job-progress-bar"></div></div>
+    <div id="profile-progress-text">正在处理…</div>
+    <div class="small muted" style="margin-top:8px">
+      已等待 <span id="profile-elapsed">0</span> 秒
+    </div>
+  </div>
+</div>
+
+<script>
+async function submitProfileJob(event, form, text) {{
+  event.preventDefault();
+  const overlay = document.getElementById('profile-progress');
+  document.getElementById('profile-progress-text').textContent = text;
+  overlay.hidden = false;
+  const started = Date.now();
+  const timer = setInterval(() => {{
+    document.getElementById('profile-elapsed').textContent = String(
+      Math.floor((Date.now() - started) / 1000)
+    );
+  }}, 1000);
+  try {{
+    const data = new FormData(form);
+    let body = data;
+    const headers = {{}};
+    if (!String(form.enctype).toLowerCase().includes('multipart/form-data')) {{
+      body = new URLSearchParams();
+      for (const [key, value] of data.entries()) {{
+        if (typeof value === 'string') body.append(key, value);
+      }}
+      headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+    }}
+    const response = await fetch(form.action, {{method:'POST', body, headers}});
+    window.location.href = response.url;
+  }} catch (error) {{
+    clearInterval(timer);
+    overlay.hidden = true;
+    alert('任务连接失败：' + error.message);
+  }}
+  return false;
+}}
+</script>
 </body>
 </html>
 """
@@ -6563,6 +6971,16 @@ class Handler(
             parsed.query
         )
 
+        if parsed.path == "/character-studio":
+            self.send_html(
+                character_studio_html(
+                    draft_id=first_value(params, "draft", ""),
+                    message=first_value(params, "message", ""),
+                    error=first_value(params, "error", ""),
+                )
+            )
+            return
+
         if parsed.path == "/":
             raw_run = first_value(
                 params,
@@ -6766,6 +7184,44 @@ class Handler(
                             )
                         ),
                     )
+                    if not result.get("error") and result.get("resolved_tag"):
+                        profile = character_profiles.get_profile(
+                            str(result["resolved_tag"])
+                        )
+                        if profile:
+                            priority = str(
+                                payload.get("profile_priority", "b")
+                            ).strip().lower()
+                            application = character_profiles.apply_profile(
+                                str(payload.get("base_prompt", "")),
+                                profile,
+                                priority,
+                            )
+                            identity_removes = list(
+                                result.get("identity_remove_tags", [])
+                            )
+                            result["appearance_remove_tags"] = list(
+                                application["remove_tags"]
+                            )
+                            result["remove_tags"] = (
+                                identity_removes
+                                + list(application["remove_tags"])
+                            )
+                            result["mode"] = (
+                                "canonical"
+                                if application["remove_tags"]
+                                else "identity_only"
+                            )
+                            result["profile"] = {
+                                "found": True,
+                                "character_tag": profile.get(
+                                    "character_tag", ""
+                                ),
+                                "names": profile.get("names", []),
+                                **application,
+                            }
+                        else:
+                            result["profile"] = {"found": False}
                 finally:
                     CHARACTER_LOCK.release()
 
@@ -6874,6 +7330,104 @@ class Handler(
                     status=500,
                 )
 
+            return
+
+        # ----------------------------------------------------
+        # Multipart: build a WD14-backed character profile draft
+        # ----------------------------------------------------
+
+        if parsed.path == "/character-studio/analyze":
+            try:
+                fields, files = parse_multipart(self)
+                character_name = first_value(
+                    fields, "character_name", ""
+                ).strip()
+                if not character_name:
+                    raise ValueError("请输入人物名称。")
+                raw_aliases = first_value(
+                    fields, "character_aliases", ""
+                )
+                aliases = [
+                    x.strip()
+                    for x in re.split(r"[,，、\n]+", raw_aliases)
+                    if x.strip()
+                ]
+                uploads = files.get("profile_images", [])
+                if not uploads:
+                    raise ValueError("请上传至少一张人物原设参考图。")
+                if len(uploads) > 5:
+                    raise ValueError("人物原设参考图最多上传 5 张。")
+
+                if not CHARACTER_PROFILE_LOCK.acquire(blocking=False):
+                    raise RuntimeError("另一个人物原设分析任务正在运行。")
+                try:
+                    resolution = character_resolver.resolve_character(
+                        query=character_name,
+                        base_prompt="",
+                        model=DEFAULT_CORRECTION_MODEL,
+                        ollama_url=OLLAMA_URL,
+                        mode="identity_only",
+                        preferred_tag=first_value(
+                            fields, "character_tag", ""
+                        ),
+                        user_aliases=aliases,
+                    )
+                    if resolution.get("error") or not resolution.get(
+                        "resolved_tag"
+                    ):
+                        raise ValueError(
+                            resolution.get("error")
+                            or "人物 tag 没有通过精确验证。"
+                        )
+
+                    wd14_outputs: List[str] = []
+                    source_images: List[str] = []
+                    for upload in uploads:
+                        image_path = save_uploaded_image(
+                            upload["filename"],
+                            upload["content"],
+                        )
+                        source_images.append(str(image_path))
+                        wd14_outputs.append(analyzer.run_wd14(str(image_path)))
+
+                    suggested = character_profiles.suggest_profile_tags(
+                        wd14_outputs,
+                        character_tag=str(resolution["resolved_tag"]),
+                    )
+                    if not suggested:
+                        raise ValueError(
+                            "WD14 没有提取到可用于人物原设的外观 tags；"
+                            "请换一张更干净的立绘或设定图。"
+                        )
+                    draft_id = character_profiles.create_draft(
+                        {
+                            "character_tag": str(
+                                resolution["resolved_tag"]
+                            ),
+                            "names": [character_name, *aliases],
+                            "suggested_tags": suggested,
+                            "wd14_outputs": wd14_outputs,
+                            "source_images": source_images,
+                        }
+                    )
+                finally:
+                    CHARACTER_PROFILE_LOCK.release()
+
+                self.redirect(
+                    "/character-studio",
+                    {
+                        "draft": draft_id,
+                        "message": (
+                            "WD14 分析完成；请确认人物原设加强 Prompt。"
+                        ),
+                    },
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                self.redirect(
+                    "/character-studio",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
             return
 
         # ----------------------------------------------------
@@ -6994,6 +7548,50 @@ class Handler(
 
         # Remaining POST routes are urlencoded.
         form = self.parse_urlencoded_form()
+
+        # ----------------------------------------------------
+        # Save a user-confirmed character appearance profile
+        # ----------------------------------------------------
+
+        if parsed.path == "/character-studio/save":
+            draft_id = first_value(form, "draft_id", "").strip()
+            try:
+                draft = character_profiles.load_draft(draft_id)
+                if not draft:
+                    raise ValueError("人物原设草稿不存在或已经失效。")
+                if not CHARACTER_PROFILE_LOCK.acquire(blocking=False):
+                    raise RuntimeError("另一个人物原设任务正在运行。")
+                try:
+                    profile = character_profiles.save_profile(
+                        character_tag=str(draft.get("character_tag", "")),
+                        names=list(draft.get("names", [])),
+                        prompt_tags=first_value(
+                            form, "enhancement_prompt", ""
+                        ),
+                        wd14_outputs=list(draft.get("wd14_outputs", [])),
+                        source_images=list(draft.get("source_images", [])),
+                    )
+                finally:
+                    CHARACTER_PROFILE_LOCK.release()
+                self.redirect(
+                    "/character-studio",
+                    {
+                        "message": (
+                            f"已保存 {profile['character_tag']} 的人物原设档案；"
+                            "主页面下次解析该人物时会自动调用。"
+                        )
+                    },
+                )
+            except Exception as exc:
+                traceback.print_exc()
+                self.redirect(
+                    "/character-studio",
+                    {
+                        "draft": draft_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            return
 
         # ----------------------------------------------------
         # User-confirmed Pixiv source-tag mapping
@@ -7610,6 +8208,10 @@ class Handler(
                                     "removal_verifications",
                                     [],
                                 ),
+                                "profile": character_override.get(
+                                    "profile",
+                                    {},
+                                ),
                             } if character_override else {},
                         )
 
@@ -7891,6 +8493,10 @@ class Handler(
                             "removal_verifications": character_override.get(
                                 "removal_verifications",
                                 [],
+                            ),
+                            "profile": character_override.get(
+                                "profile",
+                                {},
                             ),
                         } if character_override else {},
                     )
